@@ -18,6 +18,13 @@ set -e
 # =========================
 source config.sh
 
+# Expected variables in config.sh:
+#   ROOTDIR
+#   BASENAME
+#   GSPLAT_PROFILE
+#   COLMAP_DIR
+#   IMAGE_DIR
+
 # =========================
 # SRUN / SLURM SETTINGS
 # =========================
@@ -59,6 +66,44 @@ source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate gsplat
 
 # =========================
+# INPUT VALIDATION
+# =========================
+if [ -z "${ROOTDIR:-}" ]; then
+    echo "❌ ROOTDIR is not set in config.sh"
+    exit 1
+fi
+
+if [ -z "${BASENAME:-}" ]; then
+    echo "❌ BASENAME is not set in config.sh"
+    exit 1
+fi
+
+if [ -z "${GSPLAT_PROFILE:-}" ]; then
+    echo "❌ GSPLAT_PROFILE is not set in config.sh"
+    exit 1
+fi
+
+if [ -z "${COLMAP_DIR:-}" ]; then
+    echo "❌ COLMAP_DIR is not set in config.sh"
+    exit 1
+fi
+
+if [ -z "${IMAGE_DIR:-}" ]; then
+    echo "❌ IMAGE_DIR is not set in config.sh"
+    exit 1
+fi
+
+if [ ! -d "$COLMAP_DIR" ]; then
+    echo "❌ COLMAP_DIR does not exist: $COLMAP_DIR"
+    exit 1
+fi
+
+if [ ! -d "$IMAGE_DIR" ]; then
+    echo "❌ IMAGE_DIR does not exist: $IMAGE_DIR"
+    exit 1
+fi
+
+# =========================
 # DEBUG INFO
 # =========================
 echo "========================"
@@ -70,6 +115,11 @@ echo "user: $(whoami)"
 echo "pwd: $(pwd)"
 echo "python: $(which python)"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "ROOTDIR=$ROOTDIR"
+echo "BASENAME=$BASENAME"
+echo "GSPLAT_PROFILE=$GSPLAT_PROFILE"
+echo "COLMAP_DIR=$COLMAP_DIR"
+echo "IMAGE_DIR=$IMAGE_DIR"
 
 python - <<'PY'
 import torch
@@ -146,10 +196,9 @@ trap cleanup EXIT
 srun -v bash run.sh \
   --root "$ROOTDIR" \
   --name "$BASENAME" \
-  --video "$VIDEOSOURCE" \
+  --colmap-dir "$COLMAP_DIR" \
+  --image-dir "$IMAGE_DIR" \
   --skip-conda \
-  --preprocess-profile "$PREPROCESS_PROFILE" \
-  --gsplat-profile "$GSPLAT_PROFILE" \
-  --num-frames "$NUM_FRAMES"
+  --gsplat-profile "$GSPLAT_PROFILE"
 
 echo "✅ Job complete"
