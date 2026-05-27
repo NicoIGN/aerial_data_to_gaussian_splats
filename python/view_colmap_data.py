@@ -11,6 +11,8 @@ import numpy as np
 
 try:
     import open3d as o3d
+    import open3d.visualization.gui as gui
+    import open3d.visualization.rendering as rendering
 except ImportError:
     print("Erreur: open3d requis. Installez avec : pip install open3d")
     raise
@@ -20,6 +22,14 @@ try:
 except ImportError:
     print("Erreur: pillow requis. Installez avec : pip install pillow")
     raise
+
+
+def info(msg: str):
+    print(f"[INFO] {msg}")
+
+
+def warn(msg: str):
+    print(f"[WARN] {msg}")
 
 
 def load_json(path: Path):
@@ -36,15 +46,25 @@ def build_T_wc_from_frame(frame):
     raise ValueError("Frame invalide : manque transform_matrix")
 
 
-def create_camera_frustum(T_wc, scale=12.0, color=(1.0, 0.0, 0.0)):
+def create_camera_frustum(T_wc, scale=200.0, aspect=1.0, color=(1.0, 0.0, 0.0)):
+    """
+    Crée un frustum dont le fond de chambre est exactement cohérent
+    avec le plan image affiché.
+
+    - z = scale
+    - largeur fond = scale
+    - hauteur fond = scale / aspect
+    """
+    half_w = scale / 2.0
+    half_h = (scale / aspect) / 2.0
+
     pts_cam = np.array([
         [0.0, 0.0, 0.0],
-        [-0.5, -0.3, 1.0],
-        [0.5, -0.3, 1.0],
-        [0.5, 0.3, 1.0],
-        [-0.5, 0.3, 1.0],
+        [-half_w, -half_h, scale],
+        [ half_w, -half_h, scale],
+        [ half_w,  half_h, scale],
+        [-half_w,  half_h, scale],
     ], dtype=np.float64)
-    pts_cam *= scale
 
     R_wc = T_wc[:3, :3]
     t_wc = T_wc[:3, 3]
@@ -63,12 +83,6 @@ def create_camera_frustum(T_wc, scale=12.0, color=(1.0, 0.0, 0.0)):
     return frustum
 
 
-def create_camera_axes(T_wc, axis_size=3.0):
-    mesh = o3d.geometry.TriangleMesh.create_coordinate_frame(size=axis_size)
-    mesh.transform(T_wc)
-    return mesh
-
-
 def load_lidar_ply(colmap_dir: Path):
     candidate_paths = [
         colmap_dir / "points.ply",
@@ -77,8 +91,11 @@ def load_lidar_ply(colmap_dir: Path):
 
     for path in candidate_paths:
         if path.exists():
-            print(f"[INFO] Chargement du nuage de points : {path}")
-            return o3d.io.read_point_cloud(str(path))
+            info(f"Chargement du nuage de points : {path}")
+            pcd = o3d.io.read_point_cloud(str(path))
+            if len(pcd.points) == 0:
+                warn(f"Le nuage {path} est vide.")
+            return pcd
 
     raise FileNotFoundError(
         f"Aucun fichier de nuage de points valide trouvé dans {colmap_dir}. "
@@ -86,12 +103,87 @@ def load_lidar_ply(colmap_dir: Path):
     )
 
 
+def apply_z_scale_to_geometry(geometry, z_scale: float):
+    """
+    Applique une échelle verticale sur Z à une géométrie Open3D.
+    """
+    if abs(z_scale - 1.0) < 1e-12:
+        return geometry
+
+    if isinstance(geometry, o3d.geometry.PointCloud):
+        pts = np.asarray(geometry.points).copy()
+        if pts.size > 0:
+            pts[:, 2] *= z_scale
+            geometry.points = o3d.utility.Vector3dVector(pts)
+        return geometry
+
+    if isinstance(geometry, o3d.geometry.LineSet):
+        pts = np.asarray(geometry.points).copy()
+        if pts.size > 0:
+            pts[:, 2] *= z_scale
+            geometry.points = o3d.utility.Vector3dVector(pts)
+        return geometry
+
+    if isinstance(geometry, o3d.geometry.TriangleMesh):
+        verts = np.asarray(geometry.vertices).copy()
+        if verts.size > 0:
+            verts[:, 2] *= z_scale
+            geometry.vertices = o3d.utility.Vector3dVector(verts)
+            geometry.compute_vertex_normals()
+        return geometry
+
+    return geometry
+
+
+def colorize_point_cloud_by_z(pcd: o3d.geometry.PointCloud):
+    """
+    Si le nuage est blanc/sans couleurs utiles, applique une coloration par altitude Z.
+    """
+    pts = np.asarray(pcd.points)
+    if pts.size == 0:
+        return pcd
+
+    use_existing = False
+    if pcd.has_colors():
+        cols = np.asarray(pcd.colors)
+        if cols.size > 0:
+            # Si les couleurs ne sont pas quasi uniformes, on les garde.
+            cstd = np.std(cols, axis=0).mean()
+            use_existing = cstd > 1e-3
+
+    if use_existing:
+        info("Le nuage contient déjà des couleurs utiles, on les conserve.")
+        return pcd
+
+    z = pts[:, 2]
+    zmin = np.min(z)
+    zmax = np.max(z)
+
+    if zmax <= zmin:
+        cols = np.tile(np.array([[0.2, 0.7, 1.0]]), (len(pts), 1))
+        pcd.colors = o3d.utility.Vector3dVector(cols)
+        warn("Nuage plat en Z, application d'une couleur uniforme.")
+        return pcd
+
+    zn = (z - zmin) / (zmax - zmin)
+
+    # petite rampe lisible: bleu -> cyan -> jaune -> rouge
+    cols = np.zeros((len(zn), 3), dtype=np.float64)
+    cols[:, 0] = np.clip(1.5 * zn - 0.5, 0.0, 1.0)
+    cols[:, 1] = np.clip(1.5 - np.abs(2.0 * zn - 1.0) * 1.5, 0.0, 1.0)
+    cols[:, 2] = np.clip(1.0 - 1.5 * zn, 0.0, 1.0)
+
+    pcd.colors = o3d.utility.Vector3dVector(cols)
+    info("Coloration du nuage appliquée selon l'altitude Z.")
+    return pcd
+
+
 def preview_cache_path(cache_dir: Path, image_path: Path):
     return cache_dir / f"{image_path.stem}.jpg"
 
 
 def run_make_preview_script(make_preview_script: Path, src_path: Path, cache_dir: Path,
-                            max_size=1024, verbose=False):
+                            max_size=256, verbose=False):
     cmd = [
         sys.executable,
         str(make_preview_script),
@@ -103,91 +195,87 @@ def run_make_preview_script(make_preview_script: Path, src_path: Path, cache_dir
 
     if verbose:
         cmd.append("--verbose")
-        print(f"[INFO] Exécution: {' '.join(cmd)}")
 
-    result = subprocess.run(cmd, capture_output=not verbose, text=True)
+    info(f"Exécution make_preview.py sur {src_path.name}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if verbose and result.stdout.strip():
+        print(result.stdout.strip())
+    if verbose and result.stderr.strip():
+        print(result.stderr.strip(), file=sys.stderr)
 
     if result.returncode != 0:
-        stderr = result.stderr.strip() if result.stderr else ""
-        stdout = result.stdout.strip() if result.stdout else ""
         raise RuntimeError(
             f"Échec de make_preview.py pour {src_path}\n"
-            f"stdout: {stdout}\n"
-            f"stderr: {stderr}"
+            f"stdout: {result.stdout.strip()}\n"
+            f"stderr: {result.stderr.strip()}"
         )
 
 
-def get_preview_image(frame, colmap_dir: Path, cache_dir: Path,
-                      make_preview_script: Path, max_size=1024, verbose=False):
+def ensure_preview(frame, colmap_dir: Path, cache_dir: Path,
+                   make_preview_script: Path, max_size=256, verbose=False):
     file_path = frame.get("file_path")
     if not file_path:
+        warn("Frame sans file_path, impossible de générer le preview.")
         return None
 
     src_path = colmap_dir / file_path
     if not src_path.exists():
-        print(f"[WARN] Image introuvable pour preview: {src_path}")
+        warn(f"Image introuvable pour preview: {src_path}")
         return None
 
     cached = preview_cache_path(cache_dir, src_path)
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    if not cached.exists():
-        try:
-            run_make_preview_script(
-                make_preview_script=make_preview_script,
-                src_path=src_path,
-                cache_dir=cache_dir,
-                max_size=max_size,
-                verbose=verbose,
-            )
-        except Exception as e:
-            print(f"[WARN] Impossible de générer preview pour {src_path}: {e}")
-            return None
-
-    if not cached.exists():
-        print(f"[WARN] Preview non généré après appel make_preview.py: {cached}")
-        return None
+    if cached.exists():
+        if verbose:
+            info(f"Preview déjà présent: {cached.name}")
+        return cached
 
     try:
-        with Image.open(cached) as im:
-            return np.array(im.convert("RGB"))
+        run_make_preview_script(
+            make_preview_script=make_preview_script,
+            src_path=src_path,
+            cache_dir=cache_dir,
+            max_size=max_size,
+            verbose=verbose,
+        )
     except Exception as e:
-        print(f"[WARN] Impossible de lire preview {cached}: {e}")
+        warn(f"Impossible de générer preview pour {src_path}: {e}")
         return None
 
+    if not cached.exists():
+        warn(f"Preview non généré après appel make_preview.py: {cached}")
+        return None
 
-def create_image_mesh_on_film_back(T_wc, image_np, film_distance=12.0, film_width=12.0):
+    if verbose:
+        info(f"Preview généré: {cached.name}")
+    return cached
+
+
+def create_textured_image_quad(T_wc, scale=200.0, aspect=1.0):
     """
-    Crée un mesh triangulé coloré représentant l'image sur le fond de chambre.
-    Cela évite l'effet 'micro images espacées' du point cloud.
+    Crée un quad exactement sur le fond de chambre du frustum.
     """
-    h, w = image_np.shape[:2]
-    aspect = w / h
+    half_w = scale / 2.0
+    half_h = (scale / aspect) / 2.0
 
-    plane_w = film_width
-    plane_h = film_width / aspect
+    verts_cam = np.array([
+        [-half_w,  half_h, scale],
+        [ half_w,  half_h, scale],
+        [ half_w, -half_h, scale],
+        [-half_w, -half_h, scale],
+    ], dtype=np.float64)
 
-    xs = np.linspace(-plane_w / 2.0, plane_w / 2.0, w)
-    ys = np.linspace(-plane_h / 2.0, plane_h / 2.0, h)
+    triangles = np.array([
+        [0, 1, 2],
+        [0, 2, 3],
+    ], dtype=np.int32)
 
-    xv, yv = np.meshgrid(xs, ys)
-    zv = np.full_like(xv, film_distance, dtype=np.float64)
-
-    verts_cam = np.stack([xv, -yv, zv], axis=-1).reshape(-1, 3)
-    colors = image_np.reshape(-1, 3).astype(np.float64) / 255.0
-
-    triangles = []
-    for y in range(h - 1):
-        row0 = y * w
-        row1 = (y + 1) * w
-        for x in range(w - 1):
-            i0 = row0 + x
-            i1 = row0 + x + 1
-            i2 = row1 + x
-            i3 = row1 + x + 1
-            triangles.append([i0, i2, i1])
-            triangles.append([i1, i2, i3])
-
-    triangles = np.asarray(triangles, dtype=np.int32)
+    triangle_uvs = np.array([
+        [0.0, 1.0], [1.0, 1.0], [1.0, 0.0],
+        [0.0, 1.0], [1.0, 0.0], [0.0, 0.0],
+    ], dtype=np.float64)
 
     R_wc = T_wc[:3, :3]
     t_wc = T_wc[:3, 3]
@@ -196,30 +284,77 @@ def create_image_mesh_on_film_back(T_wc, image_np, film_distance=12.0, film_widt
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(verts_world)
     mesh.triangles = o3d.utility.Vector3iVector(triangles)
-    mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs)
+    mesh.triangle_material_ids = o3d.utility.IntVector([0, 0])
     mesh.compute_vertex_normals()
     return mesh
 
 
-def visualize_colmap(frames, lidar, colmap_dir: Path, make_preview_script: Path,
-                     show_images=True, frustum_scale=12.0, film_distance=12.0,
-                     film_width=12.0, preview_size=1024, axis_size=3.0, verbose=False):
-    geoms = [lidar]
+def add_textured_quad_to_scene(vis, name, mesh, texture_path: Path):
+    material = rendering.MaterialRecord()
+    material.shader = "defaultUnlit"
+    material.base_color = [1.0, 1.0, 1.0, 1.0]
+    material.base_roughness = 1.0
+    material.base_reflectance = 0.0
+    material.base_metallic = 0.0
+
+    tex = o3d.io.read_image(str(texture_path))
+    tex_np = np.asarray(tex)
+    if tex_np.size == 0:
+        raise ValueError(f"Texture vide: {texture_path}")
+    #info(f"Texture lue: {texture_path.name} shape={tex_np.shape}")
+
+    material.albedo_img = tex
+    vis.add_geometry(name, mesh, material)
+
+
+def launch_o3d_visualizer(frames, lidar, colmap_dir: Path, make_preview_script: Path,
+                          show_images=True, frustum_scale=200.0, film_distance=200.0,
+                          image_size=300.0, preview_size=256, point_size=2.0,
+                          z_scale=1.0, verbose=False):
     cache_dir = colmap_dir / "preview_cache"
 
-    print("[INFO] Création des frustums, axes et images sur fond de chambre...")
+    # préparation nuage : seul le nuage est affecté par z_scale,
+    # en conservant fixe le Z minimal
+    lidar = o3d.geometry.PointCloud(lidar)
+    lidar = colorize_point_cloud_by_z(lidar)
+
+    if abs(z_scale - 1.0) > 1e-12:
+        pts = np.asarray(lidar.points).copy()
+        if pts.size > 0:
+            zmin = np.min(pts[:, 2])
+            pts[:, 2] = zmin + z_scale * (pts[:, 2] - zmin)
+            lidar.points = o3d.utility.Vector3dVector(pts)
+            info(f"Échelle Z du nuage appliquée autour de zmin={zmin:.3f} avec facteur {z_scale}")
+    else:
+        info("z_scale=1.0, aucune modification verticale du nuage.")
+
+    app = gui.Application.instance
+    app.initialize()
+
+    vis = o3d.visualization.O3DVisualizer("COLMAP Viewer + Textured Images", 1600, 1000)
+    vis.show_settings = True
+    vis.scene.set_background([0.05, 0.05, 0.05, 1.0])
+
+    mat_pcd = rendering.MaterialRecord()
+    mat_pcd.shader = "defaultUnlit"
+    mat_pcd.point_size = point_size
+    vis.add_geometry("lidar", lidar, mat_pcd)
+
+    shown_images = 0
+
     for i, frame in enumerate(frames):
         try:
             T_wc = build_T_wc_from_frame(frame)
         except Exception as e:
-            print(f"[WARN] Frame #{i} ignorée: {e}")
+            warn(f"Frame #{i} ignorée: {e}")
             continue
 
-        geoms.append(create_camera_frustum(T_wc, scale=frustum_scale, color=(1.0, 0.0, 0.0)))
-        geoms.append(create_camera_axes(T_wc, axis_size=axis_size))
+        aspect = 1.0
+        texture_path = None
 
         if show_images:
-            image_np = get_preview_image(
+            texture_path = ensure_preview(
                 frame,
                 colmap_dir,
                 cache_dir,
@@ -227,35 +362,81 @@ def visualize_colmap(frames, lidar, colmap_dir: Path, make_preview_script: Path,
                 max_size=preview_size,
                 verbose=verbose,
             )
-            if image_np is not None:
+            if texture_path is not None:
                 try:
-                    img_mesh = create_image_mesh_on_film_back(
-                        T_wc,
-                        image_np,
-                        film_distance=film_distance,
-                        film_width=film_width,
-                    )
-                    geoms.append(img_mesh)
+                    with Image.open(texture_path) as im:
+                        w, h = im.size
+                    if h > 0 and w > 0:
+                        aspect = w / h
+                    else:
+                        warn(f"Texture invalide: {texture_path} ({w}x{h})")
+                        texture_path = None
                 except Exception as e:
-                    print(f"[WARN] Impossible d'ajouter l'image 3D pour {frame.get('file_path')}: {e}")
+                    warn(f"Impossible de lire la taille de texture pour {frame.get('file_path')}: {e}")
+                    texture_path = None
 
-    print("[INFO] Lancement du viewer...")
-    o3d.visualization.draw_geometries(
-        geoms,
-        window_name="COLMAP Viewer + Images on Film Back"
-    )
+        frustum = create_camera_frustum(
+            T_wc,
+            scale=frustum_scale,
+            aspect=aspect,
+            color=(1.0, 0.0, 0.0),
+        )
+        mat_line = rendering.MaterialRecord()
+        mat_line.shader = "unlitLine"
+        mat_line.line_width = 4.0
+        vis.add_geometry(f"frustum_{i}", frustum, mat_line)
+
+        if not show_images or texture_path is None:
+            if show_images:
+                warn(f"Pas de texture exploitable pour frame #{i}")
+            continue
+
+        try:
+            quad = create_textured_image_quad(
+                T_wc,
+                scale=frustum_scale,
+                aspect=aspect,
+            )
+            add_textured_quad_to_scene(vis, f"img_{i}", quad, texture_path)
+            shown_images += 1
+            if verbose:
+                info(f"Image texturée ajoutée au fond de chambre: {frame.get('file_path')}")
+        except Exception as e:
+            warn(f"Impossible d'ajouter l'image texturée pour {frame.get('file_path')}: {e}")
+
+    info(f"Nombre total d'images texturées ajoutées: {shown_images}")
+    if shown_images == 0 and show_images:
+        warn("Aucune image texturée n'a été ajoutée à la scène.")
+
+    bounds = lidar.get_axis_aligned_bounding_box()
+    center = bounds.get_center()
+    extent = np.max(bounds.get_extent())
+    eye = center + np.array([0.0, -2.0 * max(extent, 1.0), 1.0 * max(extent, 1.0)])
+    up = [0.0, 0.0, 1.0]
+    vis.setup_camera(60.0, center, eye, up)
+
+    app.add_window(vis)
+    app.run()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Affiche les données COLMAP dans un viewer 3D avec images sur fond de chambre")
+    script_dir = Path(__file__).resolve().parent
+    default_make_preview = script_dir / "make_preview.py"
+
+    ap = argparse.ArgumentParser(description="Affiche les données COLMAP avec images texturées au fond de chambre")
     ap.add_argument("--colmap-dir", required=True, help="Répertoire contenant transforms.json et le nuage de points")
-    ap.add_argument("--make-preview-script", required=True, help="Chemin vers le script make_preview.py")
-    ap.add_argument("--no-images", action="store_true", help="Désactive l'affichage des previews image en 3D")
-    ap.add_argument("--frustum-scale", type=float, default=12.0, help="Taille du frustum caméra")
-    ap.add_argument("--axis-size", type=float, default=3.0, help="Taille des axes caméra")
-    ap.add_argument("--film-distance", type=float, default=12.0, help="Distance du fond de chambre")
-    ap.add_argument("--film-width", type=float, default=12.0, help="Largeur du fond de chambre")
-    ap.add_argument("--preview-size", type=int, default=1024, help="Taille max des previews en cache")
+    ap.add_argument(
+        "--make-preview-script",
+        default=str(default_make_preview),
+        help="Chemin vers le script make_preview.py (défaut: même dossier que ce script)",
+    )
+    ap.add_argument("--no-images", action="store_true", help="Désactive l'affichage des images")
+    ap.add_argument("--frustum-scale", type=float, default=200.0, help="Taille du frustum caméra")
+    ap.add_argument("--film-distance", type=float, default=200.0, help="Distance du fond de chambre")
+    ap.add_argument("--image-size", type=float, default=300.0, help="Largeur de l'image affichée")
+    ap.add_argument("--preview-size", type=int, default=256, help="Taille max des previews en cache")
+    ap.add_argument("--point-size", type=float, default=2.0, help="Taille d'affichage des points du nuage")
+    ap.add_argument("--z-scale", type=float, default=1.0, help="Facteur d'échelle appliqué à Z pour l'affichage")
     ap.add_argument("--verbose", action="store_true", help="Affiche les logs détaillés")
     args = ap.parse_args()
 
@@ -269,14 +450,16 @@ def main():
     if not make_preview_script.exists():
         raise FileNotFoundError(f"Script make_preview.py introuvable: {make_preview_script}")
 
-    print("[INFO] Chargement des données JSON...")
+    info("Chargement des données JSON...")
     data = load_json(transforms_path)
     frames = data.get("frames", [])
     if not frames:
         raise ValueError("Aucune caméra ou frame valide détectée dans transforms.json")
 
+    info(f"Nombre de frames chargées: {len(frames)}")
     lidar = load_lidar_ply(colmap_dir)
-    visualize_colmap(
+
+    launch_o3d_visualizer(
         frames,
         lidar,
         colmap_dir=colmap_dir,
@@ -284,9 +467,10 @@ def main():
         show_images=not args.no_images,
         frustum_scale=args.frustum_scale,
         film_distance=args.film_distance,
-        film_width=args.film_width,
+        image_size=args.image_size,
         preview_size=args.preview_size,
-        axis_size=args.axis_size,
+        point_size=args.point_size,
+        z_scale=args.z_scale,
         verbose=args.verbose,
     )
 
