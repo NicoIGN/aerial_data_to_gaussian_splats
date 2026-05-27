@@ -433,15 +433,15 @@ def main():
     write_images_txt(out_sparse / "images.txt", frames)
     write_points3D_txt(out_sparse / "points3D.txt", pts_xyz, pts_rgb)
 
-    log("[7/8] Export sparse_pc.ply et transforms.json...", 1, args.verbose)
-    write_ply(out_dir / "sparse_pc.ply", pts_xyz, pts_rgb)
-    build_transforms_json(out_dir / "transforms.json", frames, width, height, fx, fy, cx, cy)
+    log("[7/8] Export transforms.json...", 1, args.verbose)
+    # write_ply(out_dir / "sparse_pc.ply", pts_xyz, pts_rgb)
+    build_transforms_json(out_colmap / "transforms.json", frames, width, height, fx, fy, cx, cy)
 
     log("[8/8] Conversion binaire optionnelle...", 1, args.verbose)
     try_write_colmap_bin(out_sparse, args.verbose)
 
-    touch_if_missing(out_sparse / "database.db")
-    touch_if_missing(out_sparse / "frames.bin")
+    # touch_if_missing(out_sparse / "database.db")
+    # touch_if_missing(out_sparse / "frames.bin")
 
     print("\nTerminé.")
     print(f"Sortie: {out_dir}")
