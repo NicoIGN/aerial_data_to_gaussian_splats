@@ -282,15 +282,12 @@ fi
 # ======================
 # DATA STRUCTURE
 # ======================
-ORI_DIR="$ROOT_DIR/ori"
-WORK_COLMAP_DIR="$ORI_DIR/colmap"
-WORK_IMAGE_DIR="$ORI_DIR/images"
 
 OUTPUT_DIR="$ROOT_DIR/model3d"
 EXPORT_DIR="$ROOT_DIR/exports"
 TRAIN_DIR="$ROOT_DIR"
 
-mkdir -p "$ORI_DIR" "$OUTPUT_DIR" "$EXPORT_DIR" "$TRAIN_DIR"
+mkdir -p "$OUTPUT_DIR" "$EXPORT_DIR" "$TRAIN_DIR"
 
 echo "📦 ROOT: $ROOT_DIR"
 echo "📦 COLMAP INPUT: $COLMAP_DIR"
@@ -300,25 +297,10 @@ echo "📦 IMAGE INPUT:  $IMAGE_DIR"
 # PREPARE WORKING ORI DIR
 # ======================
 echo ""
-echo "🧱 Preparing working ORI directory..."
 
-if [ -e "$WORK_COLMAP_DIR" ]; then
-  echo "⏩ Working colmap dir already exists: $WORK_COLMAP_DIR"
-else
-  ln -s "$(cd "$COLMAP_DIR" && pwd)" "$WORK_COLMAP_DIR"
-  echo "🔗 Linked colmap dir -> $WORK_COLMAP_DIR"
-fi
-
-if [ -e "$WORK_IMAGE_DIR" ]; then
-  echo "⏩ Working image dir already exists: $WORK_IMAGE_DIR"
-else
-  ln -s "$(cd "$IMAGE_DIR" && pwd)" "$WORK_IMAGE_DIR"
-  echo "🔗 Linked image dir -> $WORK_IMAGE_DIR"
-fi
-
-if [ ! -f "$ORI_DIR/transforms.json" ]; then
-  echo "❌ Missing transforms.json in $ORI_DIR"
-  echo "👉 This training pipeline expects $ROOT_DIR/ori/transforms.json to exist."
+if [ ! -f "$COLMAP_DIR/transforms.json" ]; then
+  echo "❌ Missing transforms.json in $COLMAP_DIR"
+  echo "👉 This training pipeline expects $COLMAP_DIR/transforms.json to exist."
   echo "👉 Copy or generate it before running."
   exit 1
 fi
@@ -329,7 +311,7 @@ fi
 if [ "$SKIP_TRAINING" = true ]; then
   echo "⏩ Skipping training (config)"
 else
-    COLMAP_SPARSE_DIR="$WORK_COLMAP_DIR/sparse/0"
+    COLMAP_SPARSE_DIR="$COLMAP_DIR/sparse/0"
 
     if [ ! -d "$COLMAP_SPARSE_DIR" ]; then
       echo "❌ COLMAP directory not found: $COLMAP_SPARSE_DIR"
@@ -386,7 +368,7 @@ else
         MAX_JOBS="$MAX_JOBS" \
         STEPS_PER_SAVE="$STEPS_PER_SAVE" \
         STEPS_PER_EVAL_ALL_IMAGES="$STEPS_PER_EVAL_ALL_IMAGES" \
-        DATA="$ORI_DIR" \
+        DATA="$COLMAP_DIR" \
         EXPERIMENT_NAME="$EXPERIMENT_NAME" \
         OUTPUTDIR="$TRAIN_DIR" \
         TRAIN_RAYS_PER_BATCH="$TRAIN_RAYS_PER_BATCH" \
@@ -524,7 +506,7 @@ if [[ ! -f "$PLY_FILE" ]]; then
   exit 1
 fi
 
-COLMAP_POINTS="$WORK_COLMAP_DIR/sparse/0/points3D.bin"
+COLMAP_POINTS="$COLMAP_DIR/sparse/0/points3D.bin"
 
 if [[ ! -f "$COLMAP_POINTS" ]]; then
   echo "❌ COLMAP points not found: $COLMAP_POINTS"
