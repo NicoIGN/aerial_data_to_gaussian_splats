@@ -51,7 +51,13 @@ mkdir -p "$MPLCONFIGDIR"
 # =========================
 # PROJECT
 # =========================
-cd "$HOME_SLURM/video_to_ply"
+: "${GIT_ROOT:?❌ GIT_ROOT is not set. Example: export GIT_ROOT=/path/to/git_project}"
+
+if [ ! -d "$GIT_ROOT" ]; then
+    echo "❌ GIT_ROOT does not exist or is not a directory: $GIT_ROOT"
+    exit 1
+fi
+cd $GIT_ROOT
 
 # =========================
 # CONDA ENV
