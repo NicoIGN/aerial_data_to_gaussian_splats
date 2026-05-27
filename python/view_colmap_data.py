@@ -506,6 +506,9 @@ def launch_o3d_visualizer(frames, lidar, colmap_images, colmap_dir: Path, make_p
     camera_scale_slider.double_value = float(frustum_scale)
     panel.add_child(camera_scale_slider)
 
+    apply_sliders_button = gui.Button("Appliquer tailles/échelles")
+    panel.add_child(apply_sliders_button)
+
     panel.add_child(gui.Label("Repère COLMAP normalisé"))
     panel.add_child(gui.Label("Raccourci : Ctrl/Cmd + Q ou Esc pour quitter"))
 
@@ -589,32 +592,10 @@ def launch_o3d_visualizer(frames, lidar, colmap_images, colmap_dir: Path, make_p
         "camera_names": [],
         "image_names": [],
         "view_initialized": False,
+        "pending_z_scale": float(z_scale),
+        "pending_point_size": float(point_size),
+        "pending_frustum_scale": float(frustum_scale),
     }
-
-    def _compute_camera_centers_world():
-        centers = []
-
-        for frame in frames:
-            colmap_im_id = frame.get("colmap_im_id")
-            if colmap_im_id is None:
-                continue
-
-            colmap_image = colmap_images.get(int(colmap_im_id))
-            if colmap_image is None:
-                continue
-
-            T_wc = build_T_wc_from_colmap_image(colmap_image)
-            c = T_wc[:3, 3].copy()
-
-            if state["flip_z"]:
-                c[2] *= -1.0
-
-            centers.append(c)
-
-        if not centers:
-            return np.zeros((0, 3), dtype=np.float64)
-
-        return np.asarray(centers, dtype=np.float64)
 
     def _world_to_display(points):
         pts = np.asarray(points, dtype=np.float64).copy()
@@ -825,6 +806,17 @@ def launch_o3d_visualizer(frames, lidar, colmap_images, colmap_dir: Path, make_p
     def _refresh_scene():
         _rebuild_scene(reset_camera=False)
 
+    def _apply_pending_slider_values():
+        state["z_scale"] = float(state["pending_z_scale"])
+        state["point_size"] = float(state["pending_point_size"])
+        state["frustum_scale"] = float(state["pending_frustum_scale"])
+
+        zscale_label.text = f"Échelle Z : {state['z_scale']:.2f}"
+        pointsize_label.text = f"Taille des points : {state['point_size']:.1f}"
+        camera_scale_label.text = f"Taille des caméras : {state['frustum_scale']:.3f}"
+
+        _refresh_scene()
+
     def _on_toggle_pointcloud(checked):
         state["show_pointcloud"] = bool(checked)
         _refresh_scene()
@@ -843,18 +835,24 @@ def launch_o3d_visualizer(frames, lidar, colmap_images, colmap_dir: Path, make_p
 
     def _on_recenter():
         centers = []
+
         for frame in frames:
             colmap_im_id = frame.get("colmap_im_id")
             if colmap_im_id is None:
                 continue
+
             colmap_image = colmap_images.get(int(colmap_im_id))
             if colmap_image is None:
                 continue
+
             T_wc = build_T_wc_from_colmap_image(colmap_image)
             c = T_wc[:3, 3].copy()
+
             if state["flip_z"]:
                 c[2] *= -1.0
-            centers.append(_world_to_display(c.reshape(1, 3))[0])
+
+            c = _world_to_display(c.reshape(1, 3))[0]
+            centers.append(c)
 
         if not centers:
             warn("Impossible de recentrer: aucune position caméra disponible.")
@@ -863,44 +861,104 @@ def launch_o3d_visualizer(frames, lidar, colmap_images, colmap_dir: Path, make_p
         centers = np.asarray(centers, dtype=np.float64)
         cmin = centers.min(axis=0)
         cmax = centers.max(axis=0)
-        bounds = o3d.geometry.AxisAlignedBoundingBox(cmin, cmax)
+        bbox_center = 0.5 * (cmin + cmax)
+        bbox_extent = cmax - cmin
+        bbox_radius = 0.5 * np.linalg.norm(bbox_extent)
+        if bbox_radius < 1e-6:
+            bbox_radius = 1.0
 
-        extent = bounds.get_extent()
-        pad = np.maximum(extent * 0.1, 1e-3)
-        bounds = o3d.geometry.AxisAlignedBoundingBox(
-            bounds.min_bound - pad,
-            bounds.max_bound + pad
-        )
+        try:
+            cam = scene_widget.scene.camera
 
-        _setup_camera_with_bounds(bounds)
-        window.post_redraw()
+            model = np.asarray(cam.get_model_matrix(), dtype=np.float64)
+            if model.shape != (4, 4):
+                raise ValueError(f"get_model_matrix() retourne une matrice de forme inattendue: {model.shape}")
+
+            cam_right = model[:3, 0]
+            cam_up = model[:3, 1]
+            cam_forward = model[:3, 2]
+            cam_pos = model[:3, 3]
+
+            def _safe_normalize(v, fallback):
+                n = np.linalg.norm(v)
+                if n < 1e-12:
+                    return np.asarray(fallback, dtype=np.float64)
+                return v / n
+
+            cam_right = _safe_normalize(cam_right, [1.0, 0.0, 0.0])
+            cam_up = _safe_normalize(cam_up, [0.0, 1.0, 0.0])
+            cam_forward = _safe_normalize(cam_forward, [0.0, 0.0, 1.0])
+
+            view_dir = -cam_forward
+
+            delta = bbox_center - cam_pos
+
+            depth = np.dot(delta, view_dir)
+            x_offset = np.dot(delta, cam_right)
+            y_offset = np.dot(delta, cam_up)
+
+            lateral_shift = x_offset * cam_right + y_offset * cam_up
+
+            fov_deg = float(cam.get_field_of_view())
+            fov_rad = np.deg2rad(fov_deg)
+            target_dist = bbox_radius / max(np.tan(fov_rad * 0.5), 1e-6) * 1.2
+            target_dist = max(target_dist, 1e-3)
+
+            new_eye = cam_pos + lateral_shift + (depth - target_dist) * view_dir
+            new_lookat = new_eye + view_dir
+
+            scene_widget.look_at(new_lookat, new_eye, cam_up)
+
+            try:
+                near = max(target_dist * 0.001, 0.001)
+                far = max(target_dist + 4.0 * bbox_radius, 10.0)
+                scene_widget.scene.camera.set_projection(
+                    fov_deg,
+                    scene_widget.frame.width / max(scene_widget.frame.height, 1),
+                    near,
+                    far,
+                    rendering.Camera.FovType.Vertical
+                )
+            except Exception:
+                pass
+
+            window.post_redraw()
+
+        except Exception as e:
+            warn(f"Impossible de recentrer la vue: {e}")
 
     def _on_zscale_changed(value):
-        state["z_scale"] = float(value)
-        zscale_label.text = f"Échelle Z : {state['z_scale']:.2f}"
-        _refresh_scene()
+        state["pending_z_scale"] = float(value)
+        zscale_label.text = f"Échelle Z : {state['pending_z_scale']:.2f}"
 
     def _on_pointsize_changed(value):
-        state["point_size"] = float(value)
-        pointsize_label.text = f"Taille des points : {state['point_size']:.1f}"
-        _refresh_scene()
+        state["pending_point_size"] = float(value)
+        pointsize_label.text = f"Taille des points : {state['pending_point_size']:.1f}"
 
     def _on_camera_scale_changed(value):
-        state["frustum_scale"] = float(value)
-        camera_scale_label.text = f"Taille des caméras : {state['frustum_scale']:.3f}"
-        _refresh_scene()
+        state["pending_frustum_scale"] = float(value)
+        camera_scale_label.text = f"Taille des caméras : {state['pending_frustum_scale']:.3f}"
 
     def _on_key(event):
         if event.type == gui.KeyEvent.DOWN:
-            if event.key == gui.KeyName.Q and (
-                event.is_modifier_down(gui.KeyModifier.CTRL)
-                or event.is_modifier_down(gui.KeyModifier.META)
-            ):
+
+            # Cmd + Q (macOS) ou Ctrl + Q
+            if event.key == gui.KeyName.Q:
+                is_cmd = event.is_modifier_down(gui.KeyModifier.META)
+                is_ctrl = event.is_modifier_down(gui.KeyModifier.CTRL)
+
+                if is_cmd or is_ctrl:
+                    gui.Application.instance.quit()
+                    return True
+
+            # Esc
+            if event.key == gui.KeyName.ESCAPE:
                 gui.Application.instance.quit()
                 return True
 
-            if event.key == gui.KeyName.ESCAPE:
-                gui.Application.instance.quit()
+            # Enter
+            if event.key == gui.KeyName.ENTER:
+                _apply_pending_slider_values()
                 return True
 
         return False
@@ -922,6 +980,7 @@ def launch_o3d_visualizer(frames, lidar, colmap_images, colmap_dir: Path, make_p
     zscale_slider.set_on_value_changed(_on_zscale_changed)
     pointsize_slider.set_on_value_changed(_on_pointsize_changed)
     camera_scale_slider.set_on_value_changed(_on_camera_scale_changed)
+    apply_sliders_button.set_on_clicked(_apply_pending_slider_values)
 
     _rebuild_scene(reset_camera=True)
     app.run()
