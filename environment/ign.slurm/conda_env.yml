@@ -1,0 +1,80 @@
+name: gsplat
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+
+  ########################################
+  # BUILD TOOLS
+  ########################################
+  - cmake
+  - ninja
+
+  # GCC 11 REQUIRED FOR CUDA 12.1 EXTENSIONS
+  - gcc_linux-64=11
+  - gxx_linux-64=11
+
+  ########################################
+  # PYTORCH CUDA 12.1
+  ########################################
+  - pytorch=2.3.1
+  - torchvision=0.18.1
+  - torchaudio=2.3.1
+  - pytorch-cuda=12.1
+
+  ########################################
+  # CUDA BUILD COMPONENTS ONLY
+  # IMPORTANT:
+  # DO NOT INSTALL cuda-toolkit
+  # DO NOT INSTALL cuda-libraries
+  # DO NOT INSTALL cuda-opencl
+  ########################################
+  - cuda-nvcc=12.1
+  - cuda-cudart-dev=12.1
+  - cuda-cccl=12.1
+  - cuda-opencl=12.1
+  
+  ########################################
+  # SCIENTIFIC STACK
+  ########################################
+  - "numpy<2"
+  - scipy
+
+  ########################################
+  # UTILITIES
+  ########################################
+  - tqdm
+  - matplotlib
+  - ffmpeg
+  - imageio
+  - imageio-ffmpeg
+  - plyfile
+  - openh264
+
+  ########################################
+  # GEOMETRY / SFM
+  ########################################
+  - colmap=3.8
+  - faiss-cpu
+  - pycolmap
+
+  ########################################
+  # OPTIONAL UTILS
+  ########################################
+  - tree
+  - rclone
+
+  ########################################
+  # PIP PACKAGES
+  ########################################
+  - pip:
+      - nerfstudio==1.1.5
+      - fpsample
+      - ultralytics
+      - git+https://github.com/cvg/Hierarchical-Localization.git
+      - git+https://github.com/facebookresearch/segment-anything.git
