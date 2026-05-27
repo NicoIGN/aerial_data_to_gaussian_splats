@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -37,42 +38,60 @@ def load_json(path: Path):
         return json.load(f)
 
 
-def build_T_wc_from_frame(frame):
-    if "transform_matrix" in frame:
-        T_wc = np.array(frame["transform_matrix"], dtype=np.float64)
-        if T_wc.shape != (4, 4):
-            raise ValueError("transform_matrix doit être 4x4")
-        return T_wc
-    raise ValueError("Frame invalide : manque transform_matrix")
+def qvec_to_rotmat(qvec):
+    qvec = np.asarray(qvec, dtype=np.float64)
+    qvec = qvec / np.linalg.norm(qvec)
+    w, x, y, z = qvec
+
+    return np.array([
+        [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * w * z,     2 * x * z + 2 * w * y],
+        [2 * x * y + 2 * w * z,     1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * w * x],
+        [2 * x * z - 2 * w * y,     2 * y * z + 2 * w * x,     1 - 2 * x * x - 2 * y * y],
+    ], dtype=np.float64)
 
 
-def create_camera_frustum(T_wc, scale=200.0, aspect=1.0, color=(1.0, 0.0, 0.0)):
-    """
-    Crée un frustum dont le fond de chambre est exactement cohérent
-    avec le plan image affiché.
+def build_T_wc_from_colmap_image(colmap_image):
+    qvec = np.asarray(colmap_image["qvec"], dtype=np.float64)
+    tvec = np.asarray(colmap_image["tvec"], dtype=np.float64)
 
-    - z = scale
-    - largeur fond = scale
-    - hauteur fond = scale / aspect
-    """
+    R_cw = qvec_to_rotmat(qvec)
+    R_wc = R_cw.T
+    C = -R_wc @ tvec
+
+    T_wc = np.eye(4, dtype=np.float64)
+    T_wc[:3, :3] = R_wc
+    T_wc[:3, 3] = C
+    return T_wc
+
+
+def apply_z_flip_to_T_wc(T_wc):
+    T = np.array(T_wc, dtype=np.float64, copy=True)
+    F = np.diag([1.0, 1.0, -1.0, 1.0])
+    return F @ T
+
+
+def create_camera_frustum(T_wc, scale=0.15, aspect=1.0, color=(1.0, 0.0, 0.0), flip_z=False):
     half_w = scale / 2.0
     half_h = (scale / aspect) / 2.0
 
     pts_cam = np.array([
         [0.0, 0.0, 0.0],
         [-half_w, -half_h, scale],
-        [ half_w, -half_h, scale],
-        [ half_w,  half_h, scale],
-        [-half_w,  half_h, scale],
+        [half_w, -half_h, scale],
+        [half_w, half_h, scale],
+        [-half_w, half_h, scale],
     ], dtype=np.float64)
 
     R_wc = T_wc[:3, :3]
     t_wc = T_wc[:3, 3]
     pts_world = (R_wc @ pts_cam.T).T + t_wc
 
+    if flip_z:
+        pts_world[:, 2] *= -1.0
+
     lines = [
         [0, 1], [0, 2], [0, 3], [0, 4],
-        [1, 2], [2, 3], [3, 4], [4, 1]
+        [1, 2], [2, 3], [3, 4], [4, 1],
     ]
     colors = np.tile(np.array(color, dtype=np.float64), (len(lines), 1))
 
@@ -83,99 +102,41 @@ def create_camera_frustum(T_wc, scale=200.0, aspect=1.0, color=(1.0, 0.0, 0.0)):
     return frustum
 
 
-def load_lidar_ply(colmap_dir: Path):
-    candidate_paths = [
-        colmap_dir / "points.ply",
-        colmap_dir / "sparse_pc.ply",
-    ]
+def create_textured_image_quad(T_wc, scale=0.15, aspect=1.0, flip_z=False):
+    half_w = scale / 2.0
+    half_h = (scale / aspect) / 2.0
 
-    for path in candidate_paths:
-        if path.exists():
-            info(f"Chargement du nuage de points : {path}")
-            pcd = o3d.io.read_point_cloud(str(path))
-            if len(pcd.points) == 0:
-                warn(f"Le nuage {path} est vide.")
-            return pcd
+    verts_cam = np.array([
+        [-half_w, half_h, scale],
+        [half_w, half_h, scale],
+        [half_w, -half_h, scale],
+        [-half_w, -half_h, scale],
+    ], dtype=np.float64)
 
-    raise FileNotFoundError(
-        f"Aucun fichier de nuage de points valide trouvé dans {colmap_dir}. "
-        f"Recherchés : {[str(p) for p in candidate_paths]}"
-    )
+    triangles = np.array([
+        [0, 1, 2],
+        [0, 2, 3],
+    ], dtype=np.int32)
 
+    triangle_uvs = np.array([
+        [0.0, 0.0], [1.0, 0.0], [1.0, 1.0],
+        [0.0, 0.0], [1.0, 1.0], [0.0, 1.0],
+    ], dtype=np.float64)
 
-def apply_z_scale_to_geometry(geometry, z_scale: float):
-    """
-    Applique une échelle verticale sur Z à une géométrie Open3D.
-    """
-    if abs(z_scale - 1.0) < 1e-12:
-        return geometry
+    R_wc = T_wc[:3, :3]
+    t_wc = T_wc[:3, 3]
+    verts_world = (R_wc @ verts_cam.T).T + t_wc
 
-    if isinstance(geometry, o3d.geometry.PointCloud):
-        pts = np.asarray(geometry.points).copy()
-        if pts.size > 0:
-            pts[:, 2] *= z_scale
-            geometry.points = o3d.utility.Vector3dVector(pts)
-        return geometry
+    if flip_z:
+        verts_world[:, 2] *= -1.0
 
-    if isinstance(geometry, o3d.geometry.LineSet):
-        pts = np.asarray(geometry.points).copy()
-        if pts.size > 0:
-            pts[:, 2] *= z_scale
-            geometry.points = o3d.utility.Vector3dVector(pts)
-        return geometry
-
-    if isinstance(geometry, o3d.geometry.TriangleMesh):
-        verts = np.asarray(geometry.vertices).copy()
-        if verts.size > 0:
-            verts[:, 2] *= z_scale
-            geometry.vertices = o3d.utility.Vector3dVector(verts)
-            geometry.compute_vertex_normals()
-        return geometry
-
-    return geometry
-
-
-def colorize_point_cloud_by_z(pcd: o3d.geometry.PointCloud):
-    """
-    Si le nuage est blanc/sans couleurs utiles, applique une coloration par altitude Z.
-    """
-    pts = np.asarray(pcd.points)
-    if pts.size == 0:
-        return pcd
-
-    use_existing = False
-    if pcd.has_colors():
-        cols = np.asarray(pcd.colors)
-        if cols.size > 0:
-            # Si les couleurs ne sont pas quasi uniformes, on les garde.
-            cstd = np.std(cols, axis=0).mean()
-            use_existing = cstd > 1e-3
-
-    if use_existing:
-        info("Le nuage contient déjà des couleurs utiles, on les conserve.")
-        return pcd
-
-    z = pts[:, 2]
-    zmin = np.min(z)
-    zmax = np.max(z)
-
-    if zmax <= zmin:
-        cols = np.tile(np.array([[0.2, 0.7, 1.0]]), (len(pts), 1))
-        pcd.colors = o3d.utility.Vector3dVector(cols)
-        warn("Nuage plat en Z, application d'une couleur uniforme.")
-        return pcd
-
-    zn = (z - zmin) / (zmax - zmin)
-
-    # petite rampe lisible: bleu -> cyan -> jaune -> rouge
-    cols = np.zeros((len(zn), 3), dtype=np.float64)
-    cols[:, 0] = np.clip(1.5 * zn - 0.5, 0.0, 1.0)
-    cols[:, 1] = np.clip(1.5 - np.abs(2.0 * zn - 1.0) * 1.5, 0.0, 1.0)
-    cols[:, 2] = np.clip(1.0 - 1.5 * zn, 0.0, 1.0)
-
-    pcd.colors = o3d.utility.Vector3dVector(cols)
-    info("Coloration du nuage appliquée selon l'altitude Z.")
-    return pcd
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(verts_world)
+    mesh.triangles = o3d.utility.Vector3iVector(triangles)
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs)
+    mesh.triangle_material_ids = o3d.utility.IntVector([0, 0])
+    mesh.compute_vertex_normals()
+    return mesh
 
 
 def preview_cache_path(cache_dir: Path, image_path: Path):
@@ -253,107 +214,425 @@ def ensure_preview(frame, colmap_dir: Path, cache_dir: Path,
     return cached
 
 
-def create_textured_image_quad(T_wc, scale=200.0, aspect=1.0):
-    """
-    Crée un quad exactement sur le fond de chambre du frustum.
-    """
-    half_w = scale / 2.0
-    half_h = (scale / aspect) / 2.0
+def colorize_point_cloud_by_z(pcd: o3d.geometry.PointCloud):
+    pts = np.asarray(pcd.points)
+    if pts.size == 0:
+        return pcd
 
-    verts_cam = np.array([
-        [-half_w,  half_h, scale],
-        [ half_w,  half_h, scale],
-        [ half_w, -half_h, scale],
-        [-half_w, -half_h, scale],
-    ], dtype=np.float64)
+    use_existing = False
+    if pcd.has_colors():
+        cols = np.asarray(pcd.colors)
+        if cols.size > 0:
+            cstd = np.std(cols, axis=0).mean()
+            use_existing = cstd > 1e-3
 
-    triangles = np.array([
-        [0, 1, 2],
-        [0, 2, 3],
-    ], dtype=np.int32)
+    if use_existing:
+        return pcd
 
-    triangle_uvs = np.array([
-        [0.0, 1.0], [1.0, 1.0], [1.0, 0.0],
-        [0.0, 1.0], [1.0, 0.0], [0.0, 0.0],
-    ], dtype=np.float64)
+    z = pts[:, 2]
+    zmin = np.min(z)
+    zmax = np.max(z)
 
-    R_wc = T_wc[:3, :3]
-    t_wc = T_wc[:3, 3]
-    verts_world = (R_wc @ verts_cam.T).T + t_wc
+    if zmax <= zmin:
+        cols = np.tile(np.array([[0.2, 0.7, 1.0]]), (len(pts), 1))
+        pcd.colors = o3d.utility.Vector3dVector(cols)
+        return pcd
 
-    mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = o3d.utility.Vector3dVector(verts_world)
-    mesh.triangles = o3d.utility.Vector3iVector(triangles)
-    mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs)
-    mesh.triangle_material_ids = o3d.utility.IntVector([0, 0])
-    mesh.compute_vertex_normals()
-    return mesh
+    zn = (z - zmin) / (zmax - zmin)
+
+    cols = np.zeros((len(zn), 3), dtype=np.float64)
+    cols[:, 0] = np.clip(1.5 * zn - 0.5, 0.0, 1.0)
+    cols[:, 1] = np.clip(1.5 - np.abs(2.0 * zn - 1.0) * 1.5, 0.0, 1.0)
+    cols[:, 2] = np.clip(1.0 - 1.5 * zn, 0.0, 1.0)
+
+    pcd.colors = o3d.utility.Vector3dVector(cols)
+    return pcd
 
 
-def add_textured_quad_to_scene(vis, name, mesh, texture_path: Path):
-    material = rendering.MaterialRecord()
-    material.shader = "defaultUnlit"
-    material.base_color = [1.0, 1.0, 1.0, 1.0]
-    material.base_roughness = 1.0
-    material.base_reflectance = 0.0
-    material.base_metallic = 0.0
+def load_3dpoints(colmap_dir: Path):
+    def _load_colmap_points3d_txt(path: Path):
+        points = []
+        colors = []
 
-    tex = o3d.io.read_image(str(texture_path))
-    tex_np = np.asarray(tex)
-    if tex_np.size == 0:
-        raise ValueError(f"Texture vide: {texture_path}")
-    #info(f"Texture lue: {texture_path.name} shape={tex_np.shape}")
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
 
-    material.albedo_img = tex
-    vis.add_geometry(name, mesh, material)
+                parts = line.split()
+                if len(parts) < 7:
+                    continue
+
+                x = float(parts[1])
+                y = float(parts[2])
+                z = float(parts[3])
+                r = int(parts[4])
+                g = int(parts[5])
+                b = int(parts[6])
+
+                points.append([x, y, z])
+                colors.append([r / 255.0, g / 255.0, b / 255.0])
+
+        pcd = o3d.geometry.PointCloud()
+        if points:
+            pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+            pcd.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
+            info(f"{len(points)} points chargés depuis {path}")
+        else:
+            warn(f"Aucun point chargé depuis {path}")
+        return pcd
+
+    def _load_colmap_points3d_bin(path: Path):
+        points = []
+        colors = []
+
+        with open(path, "rb") as f:
+            num_points_data = f.read(8)
+            if len(num_points_data) != 8:
+                raise ValueError("Fichier points3D.bin invalide ou vide")
+
+            num_points = struct.unpack("<Q", num_points_data)[0]
+
+            for _ in range(num_points):
+                point3d_id_data = f.read(8)
+                xyz_data = f.read(24)
+                rgb_data = f.read(3)
+                error_data = f.read(8)
+                track_len_data = f.read(8)
+
+                if len(point3d_id_data) != 8 or len(xyz_data) != 24 or len(rgb_data) != 3 or len(error_data) != 8 or len(track_len_data) != 8:
+                    raise ValueError("Fichier points3D.bin tronqué")
+
+                _point3d_id = struct.unpack("<Q", point3d_id_data)[0]
+                x, y, z = struct.unpack("<ddd", xyz_data)
+                r, g, b = struct.unpack("<BBB", rgb_data)
+                _error = struct.unpack("<d", error_data)[0]
+                track_length = struct.unpack("<Q", track_len_data)[0]
+
+                track_bytes = f.read(track_length * 8)
+                if len(track_bytes) != track_length * 8:
+                    raise ValueError("Fichier points3D.bin tronqué dans les tracks")
+
+                points.append([x, y, z])
+                colors.append([r / 255.0, g / 255.0, b / 255.0])
+
+        pcd = o3d.geometry.PointCloud()
+        if points:
+            pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+            pcd.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
+            info(f"{len(points)} points chargés depuis {path}")
+        else:
+            warn(f"Aucun point chargé depuis {path}")
+        return pcd
+
+    candidate_paths = [
+        colmap_dir / "colmap" / "sparse" / "0" / "points3D.bin",
+        colmap_dir / "colmap" / "sparse" / "0_TXT" / "points3D.txt",
+        colmap_dir / "sparse" / "0" / "points3D.bin",
+        colmap_dir / "sparse" / "0_TXT" / "points3D.txt",
+    ]
+
+    for path in candidate_paths:
+        if path.exists():
+            info(f"Chargement des points 3D COLMAP : {path}")
+            if path.suffix.lower() == ".bin":
+                return _load_colmap_points3d_bin(path)
+            elif path.suffix.lower() == ".txt":
+                return _load_colmap_points3d_txt(path)
+
+    raise FileNotFoundError(
+        "Impossible de trouver points3D.bin ou points3D.txt "
+        "dans colmap/sparse/0 ou colmap/sparse/0_TXT"
+    )
 
 
-def launch_o3d_visualizer(frames, lidar, colmap_dir: Path, make_preview_script: Path,
-                          show_images=True, frustum_scale=200.0, film_distance=200.0,
-                          image_size=300.0, preview_size=256, point_size=2.0,
-                          z_scale=1.0, verbose=False):
+def load_colmap_images(colmap_dir: Path):
+    txt_path = colmap_dir / "colmap" / "sparse" / "0_TXT" / "images.txt"
+    if not txt_path.exists():
+        txt_path = colmap_dir / "sparse" / "0_TXT" / "images.txt"
+
+    if not txt_path.exists():
+        raise FileNotFoundError(f"images.txt introuvable: {txt_path}")
+
+    images = {}
+
+    with open(txt_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        if not line or line.startswith("#"):
+            i += 1
+            continue
+
+        parts = line.split()
+        if len(parts) < 10:
+            i += 1
+            continue
+
+        image_id = int(parts[0])
+        qvec = [float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])]
+        tvec = [float(parts[5]), float(parts[6]), float(parts[7])]
+        camera_id = int(parts[8])
+        name = parts[9]
+
+        images[image_id] = {
+            "image_id": image_id,
+            "qvec": qvec,
+            "tvec": tvec,
+            "camera_id": camera_id,
+            "name": name,
+        }
+
+        i += 2
+
+    info(f"{len(images)} poses caméra COLMAP chargées depuis {txt_path}")
+    return images
+
+
+def launch_o3d_visualizer(frames, lidar, colmap_images, colmap_dir: Path, make_preview_script: Path,
+                          show_images=True, show_frustums=True,
+                          frustum_scale=4, preview_size=256, point_size=2.0,
+                          z_scale=1.0, flip_z=False, verbose=False):
     cache_dir = colmap_dir / "preview_cache"
-
-    # préparation nuage : seul le nuage est affecté par z_scale,
-    # en conservant fixe le Z minimal
-    lidar = o3d.geometry.PointCloud(lidar)
-    lidar = colorize_point_cloud_by_z(lidar)
-
-    if abs(z_scale - 1.0) > 1e-12:
-        pts = np.asarray(lidar.points).copy()
-        if pts.size > 0:
-            zmin = np.min(pts[:, 2])
-            pts[:, 2] = zmin + z_scale * (pts[:, 2] - zmin)
-            lidar.points = o3d.utility.Vector3dVector(pts)
-            info(f"Échelle Z du nuage appliquée autour de zmin={zmin:.3f} avec facteur {z_scale}")
-    else:
-        info("z_scale=1.0, aucune modification verticale du nuage.")
+    raw_lidar = o3d.geometry.PointCloud(lidar)
 
     app = gui.Application.instance
     app.initialize()
 
-    vis = o3d.visualization.O3DVisualizer("COLMAP Viewer + Textured Images", 1600, 1000)
-    vis.show_settings = True
-    vis.scene.set_background([0.05, 0.05, 0.05, 1.0])
+    window = app.create_window("Visualisation COLMAP", 1750, 1020)
 
-    mat_pcd = rendering.MaterialRecord()
-    mat_pcd.shader = "defaultUnlit"
-    mat_pcd.point_size = point_size
-    vis.add_geometry("lidar", lidar, mat_pcd)
+    em = window.theme.font_size
+    margin = 0.5 * em
 
-    shown_images = 0
+    scene_widget = gui.SceneWidget()
+    scene_widget.scene = rendering.Open3DScene(window.renderer)
+    scene_widget.scene.set_background([0.08, 0.08, 0.08, 1.0])
 
-    for i, frame in enumerate(frames):
+    # Réduction de la distance de clipping lointain
+    try:
+        scene_widget.scene.camera.set_projection(
+            60.0, 1750 / 1020, 0.001, 100.0, rendering.Camera.FovType.Vertical
+        )
+    except Exception:
+        pass
+
+    panel = gui.Vert(0.25 * em, gui.Margins(margin, margin, margin, margin))
+    panel_width = int(24 * em)
+
+    panel.add_child(gui.Label("Affichage"))
+
+    camera_checkbox = gui.Checkbox("Afficher les positions caméra")
+    camera_checkbox.checked = show_frustums
+    panel.add_child(camera_checkbox)
+
+    image_checkbox = gui.Checkbox("Afficher les images")
+    image_checkbox.checked = show_images
+    panel.add_child(image_checkbox)
+
+    flipz_checkbox = gui.Checkbox("Inverser axe Z")
+    flipz_checkbox.checked = flip_z
+    panel.add_child(flipz_checkbox)
+
+    recenter_checkbox = gui.Checkbox("Recentrer sur bbox caméras")
+    recenter_checkbox.checked = True
+    panel.add_child(recenter_checkbox)
+
+    zscale_label = gui.Label(f"Échelle Z : {z_scale:.2f}")
+    panel.add_child(zscale_label)
+
+    zscale_slider = gui.Slider(gui.Slider.DOUBLE)
+    zscale_slider.set_limits(0.1, 10.0)
+    zscale_slider.double_value = float(z_scale)
+    panel.add_child(zscale_slider)
+
+    pointsize_label = gui.Label(f"Taille des points : {point_size:.1f}")
+    panel.add_child(pointsize_label)
+
+    pointsize_slider = gui.Slider(gui.Slider.DOUBLE)
+    pointsize_slider.set_limits(1.0, 10.0)
+    pointsize_slider.double_value = float(point_size)
+    panel.add_child(pointsize_slider)
+
+    camera_scale_label = gui.Label(f"Taille des caméras : {frustum_scale:.3f}")
+    panel.add_child(camera_scale_label)
+
+    camera_scale_slider = gui.Slider(gui.Slider.DOUBLE)
+    camera_scale_slider.set_limits(0.01, 10.0)
+    camera_scale_slider.double_value = float(frustum_scale)
+    panel.add_child(camera_scale_slider)
+
+    panel.add_child(gui.Label("Repère COLMAP"))
+
+    window.add_child(panel)
+    window.add_child(scene_widget)
+
+    def _on_layout(layout_context):
+        content = window.content_rect
+        panel.frame = gui.Rect(content.x, content.y, panel_width, content.height)
+        scene_widget.frame = gui.Rect(
+            content.x + panel_width,
+            content.y,
+            content.width - panel_width,
+            content.height,
+        )
+
+    window.set_on_layout(_on_layout)
+
+    state = {
+        "show_cameras": bool(show_frustums),
+        "show_images": bool(show_images),
+        "z_scale": float(z_scale),
+        "point_size": float(point_size),
+        "frustum_scale": float(frustum_scale),
+        "flip_z": bool(flip_z),
+        "recenter_on_cameras": True,
+        "camera_names": [],
+        "image_names": [],
+        "view_initialized": False,
+    }
+
+    def _compute_camera_bbox_transform():
+        centers = []
+
+        for frame in frames:
+            colmap_im_id = frame.get("colmap_im_id")
+            if colmap_im_id is None:
+                continue
+
+            colmap_image = colmap_images.get(int(colmap_im_id))
+            if colmap_image is None:
+                continue
+
+            T_wc = build_T_wc_from_colmap_image(colmap_image)
+            c = T_wc[:3, 3].copy()
+
+            if state["flip_z"]:
+                c[2] *= -1.0
+
+            centers.append(c)
+
+        if not centers:
+            return 1.0, np.zeros(3, dtype=np.float64)
+
+        centers = np.asarray(centers, dtype=np.float64)
+        cmin = centers.min(axis=0)
+        cmax = centers.max(axis=0)
+        center = 0.5 * (cmin + cmax)
+        extent = cmax - cmin
+        max_extent = float(np.max(extent))
+
+        if max_extent < 1e-12:
+            scale = 1.0
+        else:
+            scale = 1.0 / max_extent
+
+        translation = -center
+        return scale, translation
+
+    def _apply_scene_transform(points, scale, translation):
+        pts = np.asarray(points, dtype=np.float64).copy()
+        pts = (pts + translation) * scale
+        return pts
+
+    def _build_scaled_lidar(scene_scale, scene_translation):
+        lidar_local = o3d.geometry.PointCloud(raw_lidar)
+        lidar_local = colorize_point_cloud_by_z(lidar_local)
+
+        pts = np.asarray(lidar_local.points).copy()
+        if pts.size > 0:
+            if state["flip_z"]:
+                pts[:, 2] *= -1.0
+
+            if abs(state["z_scale"] - 1.0) > 1e-12:
+                zmin = np.min(pts[:, 2])
+                pts[:, 2] = zmin + state["z_scale"] * (pts[:, 2] - zmin)
+
+            pts = _apply_scene_transform(pts, scene_scale, scene_translation)
+            lidar_local.points = o3d.utility.Vector3dVector(pts)
+
+        return lidar_local
+
+    def _clear_dynamic_geometry():
+        names = ["lidar"] + state["camera_names"] + state["image_names"]
+        for name in names:
+            try:
+                scene_widget.scene.remove_geometry(name)
+            except Exception:
+                pass
+        state["camera_names"] = []
+        state["image_names"] = []
+
+    def _setup_camera_with_bounds(bounds):
+        center = bounds.get_center()
+        scene_widget.setup_camera(60.0, bounds, center)
         try:
-            T_wc = build_T_wc_from_frame(frame)
-        except Exception as e:
-            warn(f"Frame #{i} ignorée: {e}")
-            continue
+            extent = np.linalg.norm(bounds.get_extent())
+            near = max(extent * 0.0005, 0.001)
+            far = max(extent * 4.0, 10.0)
+            scene_widget.scene.camera.set_projection(
+                60.0,
+                scene_widget.frame.width / max(scene_widget.frame.height, 1),
+                near,
+                far,
+                rendering.Camera.FovType.Vertical
+            )
+        except Exception:
+            pass
 
-        aspect = 1.0
-        texture_path = None
+    def _rebuild_scene(reset_camera=False):
+        _clear_dynamic_geometry()
 
-        if show_images:
+        if state["recenter_on_cameras"]:
+            scene_scale, scene_translation = _compute_camera_bbox_transform()
+        else:
+            scene_scale, scene_translation = 1.0, np.zeros(3, dtype=np.float64)
+
+        lidar_local = _build_scaled_lidar(scene_scale, scene_translation)
+
+        mat_pcd = rendering.MaterialRecord()
+        mat_pcd.shader = "defaultUnlit"
+        mat_pcd.point_size = state["point_size"]
+
+        bounds_candidates = []
+        camera_centers_for_view = []
+
+        if len(lidar_local.points) > 0:
+            scene_widget.scene.add_geometry("lidar", lidar_local, mat_pcd)
+            bounds_candidates.append(np.asarray(lidar_local.points))
+        else:
+            warn("Aucun point 3D à afficher.")
+
+        shown_images = 0
+        shown_cameras = 0
+        missing_ids = 0
+
+        for i, frame in enumerate(frames):
+            colmap_im_id = frame.get("colmap_im_id")
+            if colmap_im_id is None:
+                warn(f"Frame #{i} sans colmap_im_id, ignorée pour la géométrie caméra.")
+                continue
+
+            colmap_image = colmap_images.get(int(colmap_im_id))
+            if colmap_image is None:
+                warn(f"Pose COLMAP introuvable pour colmap_im_id={colmap_im_id}")
+                missing_ids += 1
+                continue
+
+            T_wc = build_T_wc_from_colmap_image(colmap_image)
+
+            camera_center = T_wc[:3, 3].copy()
+            if state["flip_z"]:
+                camera_center[2] *= -1.0
+            camera_center = (camera_center + scene_translation) * scene_scale
+
+            bounds_candidates.append(camera_center.reshape(1, 3))
+            camera_centers_for_view.append(camera_center.reshape(1, 3))
+
+            aspect = 1.0
             texture_path = ensure_preview(
                 frame,
                 colmap_dir,
@@ -362,6 +641,7 @@ def launch_o3d_visualizer(frames, lidar, colmap_dir: Path, make_preview_script: 
                 max_size=preview_size,
                 verbose=verbose,
             )
+
             if texture_path is not None:
                 try:
                     with Image.open(texture_path) as im:
@@ -369,53 +649,162 @@ def launch_o3d_visualizer(frames, lidar, colmap_dir: Path, make_preview_script: 
                     if h > 0 and w > 0:
                         aspect = w / h
                     else:
-                        warn(f"Texture invalide: {texture_path} ({w}x{h})")
                         texture_path = None
                 except Exception as e:
                     warn(f"Impossible de lire la taille de texture pour {frame.get('file_path')}: {e}")
                     texture_path = None
 
-        frustum = create_camera_frustum(
-            T_wc,
-            scale=frustum_scale,
-            aspect=aspect,
-            color=(1.0, 0.0, 0.0),
-        )
-        mat_line = rendering.MaterialRecord()
-        mat_line.shader = "unlitLine"
-        mat_line.line_width = 4.0
-        vis.add_geometry(f"frustum_{i}", frustum, mat_line)
+            current_camera_scale = state["frustum_scale"] * scene_scale
 
-        if not show_images or texture_path is None:
-            if show_images:
-                warn(f"Pas de texture exploitable pour frame #{i}")
-            continue
+            if state["show_cameras"]:
+                try:
+                    camera_name = f"camera_{i}"
+                    frustum = create_camera_frustum(
+                        T_wc,
+                        scale=current_camera_scale,
+                        aspect=aspect,
+                        color=(1.0, 0.0, 0.0),
+                        flip_z=state["flip_z"],
+                    )
 
+                    pts = np.asarray(frustum.points).copy()
+                    pts = _apply_scene_transform(pts, 1.0, scene_translation)
+                    frustum.points = o3d.utility.Vector3dVector(pts * scene_scale)
+
+                    mat_line = rendering.MaterialRecord()
+                    mat_line.shader = "unlitLine"
+                    mat_line.line_width = 2.0
+                    scene_widget.scene.add_geometry(camera_name, frustum, mat_line)
+                    state["camera_names"].append(camera_name)
+                    shown_cameras += 1
+                except Exception as e:
+                    warn(f"Impossible d'ajouter la position caméra pour {frame.get('file_path', f'frame #{i}')} : {e}")
+
+            if not state["show_images"] or texture_path is None:
+                continue
+
+            try:
+                quad = create_textured_image_quad(
+                    T_wc,
+                    scale=current_camera_scale,
+                    aspect=aspect,
+                    flip_z=state["flip_z"],
+                )
+
+                verts = np.asarray(quad.vertices).copy()
+                verts = _apply_scene_transform(verts, 1.0, scene_translation)
+                quad.vertices = o3d.utility.Vector3dVector(verts * scene_scale)
+                quad.compute_vertex_normals()
+
+                material = rendering.MaterialRecord()
+                material.shader = "defaultUnlit"
+                material.base_color = [1.0, 1.0, 1.0, 1.0]
+                material.albedo_img = o3d.io.read_image(str(texture_path))
+
+                image_name = f"img_{i}"
+                scene_widget.scene.add_geometry(image_name, quad, material)
+                state["image_names"].append(image_name)
+                shown_images += 1
+            except Exception as e:
+                warn(f"Impossible d'ajouter l'image texturée pour {frame.get('file_path')}: {e}")
+
+        info(f"Nombre total de positions caméra ajoutées: {shown_cameras}")
+        info(f"Nombre total d'images texturées ajoutées: {shown_images}")
+        if missing_ids > 0:
+            warn(f"{missing_ids} frames ignorées faute de pose COLMAP.")
+
+        if reset_camera or not state["view_initialized"]:
+            target_arrays = None
+
+            if state["recenter_on_cameras"] and camera_centers_for_view:
+                target_arrays = camera_centers_for_view
+            elif bounds_candidates:
+                target_arrays = bounds_candidates
+
+            if target_arrays:
+                all_pts = np.vstack(target_arrays)
+                pcd_bounds = o3d.geometry.PointCloud()
+                pcd_bounds.points = o3d.utility.Vector3dVector(all_pts)
+                bounds = pcd_bounds.get_axis_aligned_bounding_box()
+
+                extent = bounds.get_extent()
+                pad = np.maximum(extent * 0.1, 1e-3)
+                bounds = o3d.geometry.AxisAlignedBoundingBox(
+                    bounds.min_bound - pad,
+                    bounds.max_bound + pad
+                )
+
+                _setup_camera_with_bounds(bounds)
+                state["view_initialized"] = True
+
+    def _refresh_scene():
+        _rebuild_scene(reset_camera=False)
+
+    def _on_toggle_cameras(checked):
+        state["show_cameras"] = bool(checked)
+        _refresh_scene()
+
+    def _on_toggle_images(checked):
+        state["show_images"] = bool(checked)
+        _refresh_scene()
+
+    def _on_flip_z(checked):
+        state["flip_z"] = bool(checked)
+        _refresh_scene()
+
+    def _on_recenter(checked):
+        state["recenter_on_cameras"] = bool(checked)
+        _rebuild_scene(reset_camera=True)
+
+    def _on_zscale_changed(value):
+        state["z_scale"] = float(value)
+        zscale_label.text = f"Échelle Z : {state['z_scale']:.2f}"
+        _refresh_scene()
+
+    def _on_pointsize_changed(value):
+        state["point_size"] = float(value)
+        pointsize_label.text = f"Taille des points : {state['point_size']:.1f}"
+        _refresh_scene()
+
+    def _on_camera_scale_changed(value):
+        state["frustum_scale"] = float(value)
+        camera_scale_label.text = f"Taille des caméras : {state['frustum_scale']:.3f}"
+        _refresh_scene()
+
+    def _on_key(event):
+        if event.type == gui.KeyEvent.DOWN:
+            if event.key == gui.KeyName.Q and (
+                event.is_modifier_down(gui.KeyModifier.CTRL)
+                or event.is_modifier_down(gui.KeyModifier.META)
+            ):
+                gui.Application.instance.quit()
+                return True
+
+            if event.key == gui.KeyName.ESCAPE:
+                gui.Application.instance.quit()
+                return True
+
+        return False
+
+    scene_widget.set_on_key(_on_key)
+
+    try:
+        window.set_on_key(_on_key)
+    except Exception:
         try:
-            quad = create_textured_image_quad(
-                T_wc,
-                scale=frustum_scale,
-                aspect=aspect,
-            )
-            add_textured_quad_to_scene(vis, f"img_{i}", quad, texture_path)
-            shown_images += 1
-            if verbose:
-                info(f"Image texturée ajoutée au fond de chambre: {frame.get('file_path')}")
-        except Exception as e:
-            warn(f"Impossible d'ajouter l'image texturée pour {frame.get('file_path')}: {e}")
+            window.set_on_key_event(_on_key)
+        except Exception:
+            warn("Impossible d'attacher le raccourci clavier au niveau fenêtre.")
 
-    info(f"Nombre total d'images texturées ajoutées: {shown_images}")
-    if shown_images == 0 and show_images:
-        warn("Aucune image texturée n'a été ajoutée à la scène.")
+    camera_checkbox.set_on_checked(_on_toggle_cameras)
+    image_checkbox.set_on_checked(_on_toggle_images)
+    flipz_checkbox.set_on_checked(_on_flip_z)
+    recenter_checkbox.set_on_checked(_on_recenter)
+    zscale_slider.set_on_value_changed(_on_zscale_changed)
+    pointsize_slider.set_on_value_changed(_on_pointsize_changed)
+    camera_scale_slider.set_on_value_changed(_on_camera_scale_changed)
 
-    bounds = lidar.get_axis_aligned_bounding_box()
-    center = bounds.get_center()
-    extent = np.max(bounds.get_extent())
-    eye = center + np.array([0.0, -2.0 * max(extent, 1.0), 1.0 * max(extent, 1.0)])
-    up = [0.0, 0.0, 1.0]
-    vis.setup_camera(60.0, center, eye, up)
-
-    app.add_window(vis)
+    _rebuild_scene(reset_camera=True)
     app.run()
 
 
@@ -423,20 +812,20 @@ def main():
     script_dir = Path(__file__).resolve().parent
     default_make_preview = script_dir / "make_preview.py"
 
-    ap = argparse.ArgumentParser(description="Affiche les données COLMAP avec images texturées au fond de chambre")
-    ap.add_argument("--colmap-dir", required=True, help="Répertoire contenant transforms.json et le nuage de points")
+    ap = argparse.ArgumentParser(description="Affiche les points 3D et caméras COLMAP dans le même repère")
+    ap.add_argument("--colmap-dir", required=True, help="Répertoire racine contenant transforms.json et colmap/")
     ap.add_argument(
         "--make-preview-script",
         default=str(default_make_preview),
-        help="Chemin vers le script make_preview.py (défaut: même dossier que ce script)",
+        help="Chemin vers le script make_preview.py",
     )
     ap.add_argument("--no-images", action="store_true", help="Désactive l'affichage des images")
-    ap.add_argument("--frustum-scale", type=float, default=200.0, help="Taille du frustum caméra")
-    ap.add_argument("--film-distance", type=float, default=200.0, help="Distance du fond de chambre")
-    ap.add_argument("--image-size", type=float, default=300.0, help="Largeur de l'image affichée")
+    ap.add_argument("--no-frustums", action="store_true", help="Désactive l'affichage des positions caméra")
+    ap.add_argument("--frustum-scale", type=float, default=4, help="Taille initiale des frustums")
     ap.add_argument("--preview-size", type=int, default=256, help="Taille max des previews en cache")
     ap.add_argument("--point-size", type=float, default=2.0, help="Taille d'affichage des points du nuage")
-    ap.add_argument("--z-scale", type=float, default=1.0, help="Facteur d'échelle appliqué à Z pour l'affichage")
+    ap.add_argument("--z-scale", type=float, default=1.0, help="Facteur d'échelle appliqué à Z pour les points 3D")
+    ap.add_argument("--flip-z", action="store_true", help="Inverse l'axe Z au démarrage")
     ap.add_argument("--verbose", action="store_true", help="Affiche les logs détaillés")
     args = ap.parse_args()
 
@@ -445,32 +834,34 @@ def main():
     transforms_path = colmap_dir / "transforms.json"
 
     if not transforms_path.exists():
-        raise FileNotFoundError(f"Fichier 'transforms.json' introuvable dans {transforms_path}")
+        raise FileNotFoundError(f"Fichier 'transforms.json' introuvable: {transforms_path}")
 
     if not make_preview_script.exists():
         raise FileNotFoundError(f"Script make_preview.py introuvable: {make_preview_script}")
 
-    info("Chargement des données JSON...")
     data = load_json(transforms_path)
     frames = data.get("frames", [])
     if not frames:
-        raise ValueError("Aucune caméra ou frame valide détectée dans transforms.json")
+        raise ValueError("Aucune frame valide détectée dans transforms.json")
 
     info(f"Nombre de frames chargées: {len(frames)}")
-    lidar = load_lidar_ply(colmap_dir)
+
+    lidar = load_3dpoints(colmap_dir)
+    colmap_images = load_colmap_images(colmap_dir)
 
     launch_o3d_visualizer(
-        frames,
-        lidar,
+        frames=frames,
+        lidar=lidar,
+        colmap_images=colmap_images,
         colmap_dir=colmap_dir,
         make_preview_script=make_preview_script,
         show_images=not args.no_images,
+        show_frustums=not args.no_frustums,
         frustum_scale=args.frustum_scale,
-        film_distance=args.film_distance,
-        image_size=args.image_size,
         preview_size=args.preview_size,
         point_size=args.point_size,
         z_scale=args.z_scale,
+        flip_z=args.flip_z,
         verbose=args.verbose,
     )
 
