@@ -510,7 +510,7 @@ def launch_o3d_visualizer(frames, lidar, colmap_images, colmap_dir: Path, make_p
     panel.add_child(apply_sliders_button)
 
     panel.add_child(gui.Label("Repère COLMAP normalisé"))
-    panel.add_child(gui.Label("Raccourci : Ctrl/Cmd + Q ou Esc pour quitter"))
+    panel.add_child(gui.Label("Raccourci : Ctrl + Q ou Esc pour quitter"))
 
     window.add_child(panel)
     window.add_child(scene_widget)
@@ -939,27 +939,23 @@ def launch_o3d_visualizer(frames, lidar, colmap_images, colmap_dir: Path, make_p
         state["pending_frustum_scale"] = float(value)
         camera_scale_label.text = f"Taille des caméras : {state['pending_frustum_scale']:.3f}"
 
+    pressed_keys = set()
+
     def _on_key(event):
+        key = int(event.key)
+
+        CTRL_KEY = 258
+        Q_KEYS = {ord("q"), ord("a")}  # q physique selon layout (QWERTY/AZERTY)
+
         if event.type == gui.KeyEvent.DOWN:
+            pressed_keys.add(key)
 
-            # Cmd + Q (macOS) ou Ctrl + Q
-            if event.key == gui.KeyName.Q:
-                is_cmd = event.is_modifier_down(gui.KeyModifier.META)
-                is_ctrl = event.is_modifier_down(gui.KeyModifier.CTRL)
-
-                if is_cmd or is_ctrl:
-                    gui.Application.instance.quit()
-                    return True
-
-            # Esc
-            if event.key == gui.KeyName.ESCAPE:
+            if key in Q_KEYS and CTRL_KEY in pressed_keys:
                 gui.Application.instance.quit()
                 return True
 
-            # Enter
-            if event.key == gui.KeyName.ENTER:
-                _apply_pending_slider_values()
-                return True
+        elif event.type == gui.KeyEvent.UP:
+            pressed_keys.discard(key)
 
         return False
 
