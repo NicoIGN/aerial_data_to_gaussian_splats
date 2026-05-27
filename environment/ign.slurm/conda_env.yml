@@ -53,6 +53,7 @@ dependencies:
   - ffmpeg
   - imageio
   - imageio-ffmpeg
+  - rasterio
   - plyfile
   - openh264
 
