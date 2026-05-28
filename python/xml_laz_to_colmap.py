@@ -290,6 +290,18 @@ def axis_convention_matrix(name: str):
         return np.diag([1.0, -1.0, 1.0]).astype(np.float64)
     if name == "flip_z":
         return np.diag([1.0, 1.0, -1.0]).astype(np.float64)
+    if name == "rot_cw_90":
+        return np.array([
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+    if name == "rot_ccw_90":
+        return np.array([
+            [0.0, -1.0, 0.0],
+            [1.0,  0.0, 0.0],
+            [0.0,  0.0, 1.0],
+        ], dtype=np.float64)
     raise ValueError(f"Convention d'axes inconnue: {name}")
 
 
@@ -325,7 +337,8 @@ def main():
     ap.add_argument("--assume-camera-to-world", action="store_true",
                     help="Interprète le quaternion XML comme caméra->monde")
     ap.add_argument("--axis-convention", default="identity",
-                    choices=["identity", "flip_yz", "flip_y", "flip_z"],
+                    choices=["identity", "flip_yz", "flip_y", "flip_z", "rot_cw_90", "rot_ccw_90"],
+                    help="Convention fixe appliquée au repère caméra avant export COLMAP")
                     help="Convention fixe appliquée au repère caméra avant export COLMAP")
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                     help="0=silencieux, 1=info, 2=warn+info")
@@ -378,6 +391,7 @@ def main():
     cy = cy0 / factor
 
     log(f"  Capteur: {sensor.get('sensor_name')}", 1, args.verbose)
+    log(f"  Orientation capteur XML: {sensor.get('orientation')}", 1, args.verbose)
     log(f"  Taille native: {width0}x{height0}", 1, args.verbose)
     log(f"  Taille exportée: {width}x{height}", 1, args.verbose)
     log(f"  Focale px native: ({fx0:.3f}, {fy0:.3f})", 1, args.verbose)
