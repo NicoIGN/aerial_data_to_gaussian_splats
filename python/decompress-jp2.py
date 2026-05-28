@@ -5,7 +5,6 @@ import argparse
 import sys
 import warnings
 from pathlib import Path
-import os
 from PIL import Image
 import numpy as np
 
@@ -20,7 +19,6 @@ except ImportError:
 
 try:
     from PIL import Image, ImageFile
-
     Image.MAX_IMAGE_PIXELS = None
     ImageFile.LOAD_TRUNCATED_IMAGES = True
 except ImportError:
@@ -31,14 +29,28 @@ except ImportError:
 
 JP2_EXTENSIONS = {".jp2", ".j2k", ".jpf", ".jpx"}
 
+# suppression globale robuste
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+
 
 def verbose_print(message: str, verbose: bool):
     if verbose:
         print(message)
 
 
+def sanitize_cli_path(raw: str) -> Path:
+    if raw is None:
+        raise ValueError("Path argument is None")
+
+    cleaned = raw.replace("^C", "").strip()
+
+    if cleaned != raw:
+        print(f"⚠️ Path corrigé automatiquement: '{raw}' -> '{cleaned}'")
+
+    return Path(cleaned).expanduser().resolve()
+
+
 def normalize_to_uint8(arr: np.ndarray) -> np.ndarray:
-    """Convert any dtype to uint8."""
     if arr.dtype == np.uint8:
         return arr
 
@@ -53,16 +65,14 @@ def normalize_to_uint8(arr: np.ndarray) -> np.ndarray:
     arr = (255.0 * (arr - amin) / (amax - amin)).clip(0, 255)
     return arr.astype(np.uint8)
 
+
 def is_valid_output(image_path: Path, expected_size: tuple[int, int], verbose: bool = False) -> bool:
-    """
-    Vérifie que l'image existe, est lisible et a la bonne taille.
-    """
     if not image_path.exists():
         return False
 
     try:
         with Image.open(image_path) as img:
-            img.verify()  # check corruption
+            img.verify()
 
         with Image.open(image_path) as img:
             w, h = img.size
@@ -76,16 +86,22 @@ def is_valid_output(image_path: Path, expected_size: tuple[int, int], verbose: b
         if verbose:
             print(f"   ⚠️ invalid image: {e}")
         return False
-        
+
+
+def get_raster_size(image_path: Path):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=NotGeoreferencedWarning)
+        with rasterio.open(image_path) as ds:
+            return ds.width, ds.height
+
+
 def read_downsampled_image(
     image_path: Path,
     factor: float,
     verbose: bool = False,
 ) -> Image.Image:
-    """Read + downsample image with rasterio."""
-
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", NotGeoreferencedWarning)
+        warnings.simplefilter("ignore", category=NotGeoreferencedWarning)
 
         verbose_print(f"📖 Reading {image_path}", verbose)
 
@@ -107,7 +123,6 @@ def read_downsampled_image(
 
             band_count = ds.count
 
-            # RGB
             if band_count >= 3:
                 arr = ds.read(
                     [1, 2, 3],
@@ -116,7 +131,6 @@ def read_downsampled_image(
                 )
                 arr = np.transpose(arr, (1, 2, 0))
 
-            # grayscale
             elif band_count == 1:
                 band = ds.read(
                     1,
@@ -126,12 +140,9 @@ def read_downsampled_image(
                 arr = np.stack([band, band, band], axis=-1)
 
             else:
-                raise RuntimeError(
-                    f"Unsupported band count: {band_count}"
-                )
+                raise RuntimeError(f"Unsupported band count: {band_count}")
 
             arr = normalize_to_uint8(arr)
-
             return Image.fromarray(arr, mode="RGB")
 
 
@@ -177,18 +188,10 @@ def process_file(
 ):
     rel_path = input_path.relative_to(input_dir)
 
-    output_path = (
-        output_dir
-        / rel_path.with_suffix(get_output_extension(output_format))
-    )
+    output_path = output_dir / rel_path.with_suffix(get_output_extension(output_format))
 
-    # ─────────────────────────────────────────────
-    # Compute expected size (via rasterio, cheap)
-    # ─────────────────────────────────────────────
     try:
-        import rasterio
-        with rasterio.open(input_path) as ds:
-            src_w, src_h = ds.width, ds.height
+        src_w, src_h = get_raster_size(input_path)
     except Exception:
         src_w, src_h = None, None
 
@@ -201,29 +204,13 @@ def process_file(
     else:
         expected_w, expected_h = None, None
 
-    # ─────────────────────────────────────────────
-    # SKIP if valid cached output exists
-    # ─────────────────────────────────────────────
     if output_path.exists() and expected_w is not None:
-        try:
-            from PIL import Image
+        if is_valid_output(output_path, (expected_w, expected_h), verbose=verbose):
+            verbose_print(f"⏭️ Skip valid cache {output_path}", verbose)
+            return
+        else:
+            verbose_print(f"♻️ Corrupt/invalid cache, recomputing {output_path}", verbose)
 
-            with Image.open(output_path) as img:
-                img.verify()
-
-            with Image.open(output_path) as img:
-                w, h = img.size
-
-            if (w, h) == (expected_w, expected_h):
-                verbose_print(f"⏭️ Skip valid cache {output_path}", verbose)
-                return
-
-        except Exception:
-            verbose_print(f"♻️ Corrupt cache, recomputing {output_path}", verbose)
-
-    # ─────────────────────────────────────────────
-    # Decode + downsample
-    # ─────────────────────────────────────────────
     img = read_downsampled_image(
         image_path=input_path,
         factor=factor,
@@ -245,16 +232,8 @@ def parse_args():
         description="Decompress and downsample JP2 images."
     )
 
-    parser.add_argument(
-        "--input-dir",
-        required=True,
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        required=True,
-    )
-
+    parser.add_argument("--input-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--factor",
         type=float,
@@ -263,32 +242,12 @@ def parse_args():
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--png", action="store_true")
+    group.add_argument("--jpg", action="store_true")
+    group.add_argument("--tiff", action="store_true")
 
-    group.add_argument(
-        "--png",
-        action="store_true",
-    )
-
-    group.add_argument(
-        "--jpg",
-        action="store_true",
-    )
-
-    group.add_argument(
-        "--tiff",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--jpeg-quality",
-        type=int,
-        default=95,
-    )
-
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-    )
+    parser.add_argument("--jpeg-quality", type=int, default=95)
+    parser.add_argument("--verbose", action="store_true")
 
     return parser.parse_args()
 
@@ -296,13 +255,11 @@ def parse_args():
 def main():
     args = parse_args()
 
-    input_dir = Path(args.input_dir).expanduser().resolve()
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    input_dir = sanitize_cli_path(args.input_dir)
+    output_dir = sanitize_cli_path(args.output_dir)
 
     if not input_dir.exists():
-        raise FileNotFoundError(
-            f"Input dir not found: {input_dir}"
-        )
+        raise FileNotFoundError(f"Input dir not found: {input_dir}")
 
     if args.png:
         output_format = "png"
@@ -345,7 +302,6 @@ def main():
                 jpeg_quality=args.jpeg_quality,
                 verbose=args.verbose,
             )
-
         except Exception as e:
             failed.append((file, str(e)))
             print(f"❌ Failed: {file}")
