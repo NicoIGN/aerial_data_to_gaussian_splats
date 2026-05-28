@@ -339,7 +339,6 @@ def main():
     ap.add_argument("--axis-convention", default="identity",
                     choices=["identity", "flip_yz", "flip_y", "flip_z", "rot_cw_90", "rot_ccw_90"],
                     help="Convention fixe appliquée au repère caméra avant export COLMAP")
-                    help="Convention fixe appliquée au repère caméra avant export COLMAP")
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                     help="0=silencieux, 1=info, 2=warn+info")
     args = ap.parse_args()
