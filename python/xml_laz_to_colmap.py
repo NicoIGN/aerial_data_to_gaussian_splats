@@ -164,7 +164,13 @@ def pose_xml_to_colmap(quat_xyzw, center_xyz, assume_camera_to_world=True, axis_
         R_cw = axis_conv @ R_cw
 
     t = -R_cw @ center_xyz
-
+    
+    det = np.linalg.det(R_cw)
+    if det <= 0:
+        raise ValueError(
+            f"axis_conv produit une matrice non convertible en quaternion (det={det}). "
+            "Les flips miroirs purs comme flip_y ne peuvent pas être exportés comme pose COLMAP."
+        )
     rot_final = R.from_matrix(R_cw)
     qx, qy, qz, qw = rot_final.as_quat()
     qvec = np.array([qw, qx, qy, qz], dtype=np.float64)
@@ -305,6 +311,17 @@ def axis_convention_matrix(name: str):
     raise ValueError(f"Convention d'axes inconnue: {name}")
 
 
+def parse_axis_convention(spec: str):
+    names = [s.strip() for s in spec.split(",") if s.strip()]
+    if not names:
+        return np.eye(3, dtype=np.float64)
+
+    M = np.eye(3, dtype=np.float64)
+    for name in names:
+        M = axis_convention_matrix(name) @ M
+    return M
+
+
 def run_decompression_script(script_path: Path, input_dir: Path, output_dir: Path,
                              factor: float, jpeg_quality: int, verbose: int):
     cmd = [
@@ -336,9 +353,12 @@ def main():
     ap.add_argument("--jpeg-quality", type=int, default=95, help="Qualité JPEG de sortie")
     ap.add_argument("--assume-camera-to-world", action="store_true",
                     help="Interprète le quaternion XML comme caméra->monde")
-    ap.add_argument("--axis-convention", default="identity",
-                    choices=["identity", "flip_yz", "flip_y", "flip_z", "rot_cw_90", "rot_ccw_90"],
-                    help="Convention fixe appliquée au repère caméra avant export COLMAP")
+    ap.add_argument(
+                    "--axis-convention",
+                    default="identity",
+                    help="Transformations fixes du repère caméra, séparées par des virgules: "
+                         "identity, flip_yz, flip_y, flip_z, rot_cw_90, rot_ccw_90"
+                )
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                     help="0=silencieux, 1=info, 2=warn+info")
     args = ap.parse_args()
@@ -410,7 +430,7 @@ def main():
     decompressed_index = build_image_index(out_images)
     log(f"  {len(decompressed_index)} images exportées indexées.", 1, args.verbose)
 
-    axis_conv = axis_convention_matrix(args.axis_convention)
+    axis_conv = parse_axis_convention(args.axis_convention)
 
     log("[4/9] Lecture streaming des clichés valides...", 1, args.verbose)
     frames = []
