@@ -27,7 +27,7 @@ SKIP_IMAGE_PROCESSING=true
 ########################################
 
 # Stable long training
-MAX_ITER=30000
+MAX_ITER=8000
 
 # IMPORTANT :
 # évite la densification tardive explosive
