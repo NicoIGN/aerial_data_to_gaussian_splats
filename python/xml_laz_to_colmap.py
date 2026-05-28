@@ -390,7 +390,9 @@ def main():
 
     for idx, item in enumerate(iter_cliches_streaming(xml_path, image_index, verbose=args.verbose)):
         num_found += 1
-        frame_name = f"frame_{idx:05d}.png"
+
+        src_ext = Path(item["image_path"]).suffix
+        frame_name = f"frame_{idx:05d}{src_ext}"
 
         dst_img = out_images / frame_name
         link_symlink(item["image_path"], dst_img)

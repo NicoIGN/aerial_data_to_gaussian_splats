@@ -142,12 +142,13 @@ if [ ! -d "$COLMAP_DIR/sparse/0" ]; then
   exit 1
 fi
 
-IMAGE_COUNT=$(find "$IMAGE_DIR" -maxdepth 1 -type f \
+IMAGE_COUNT=$(find "$IMAGE_DIR" -maxdepth 1 \
+  \( -type f -o -xtype f \) \
   \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) \
   | wc -l | tr -d ' ')
 
 if [ "$IMAGE_COUNT" -lt 2 ]; then
-  echo "❌ At least 2 images are required in image-dir"
+  echo "❌ At least 2 images are required in image-dir $IMAGE_DIR"
   echo "   Found: $IMAGE_COUNT"
   exit 1
 fi
