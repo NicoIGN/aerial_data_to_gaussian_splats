@@ -351,7 +351,7 @@ def main():
     images_dir = Path(args.images)
     out_dir = Path(args.out)
 
-    out_images = out_dir / "images"
+    out_images = out_dir / "colmap" / "images"
     out_colmap = out_dir / "colmap"
     out_sparse = out_colmap / "sparse" / "0"
     out_models_0 = out_sparse / "models" / "0"
