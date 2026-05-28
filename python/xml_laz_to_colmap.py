@@ -3,9 +3,9 @@
 
 import argparse
 import json
-import os
 import shutil
 import struct
+import subprocess
 import sys
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -236,30 +236,6 @@ def read_laz_points(laz_path: Path, stride: int):
     return xyz, rgb
 
 
-def write_ply(path: Path, xyz, rgb=None):
-    n = len(xyz)
-    if rgb is None:
-        rgb = np.full((n, 3), 200, dtype=np.uint8)
-
-    with open(path, "wb") as f:
-        header = (
-            "ply\n"
-            "format binary_little_endian 1.0\n"
-            f"element vertex {n}\n"
-            "property float x\n"
-            "property float y\n"
-            "property float z\n"
-            "property uchar red\n"
-            "property uchar green\n"
-            "property uchar blue\n"
-            "end_header\n"
-        )
-        f.write(header.encode("ascii"))
-        for p, c in zip(xyz, rgb):
-            f.write(struct.pack("<fffBBB", float(p[0]), float(p[1]), float(p[2]),
-                                int(c[0]), int(c[1]), int(c[2])))
-
-
 def build_transforms_json(path: Path, frames, width, height, fx, fy, cx, cy):
     data = {
         "w": width,
@@ -305,12 +281,6 @@ def try_write_colmap_bin(sparse_dir: Path, verbose: int):
         return False
 
 
-def link_symlink(src: Path, dst: Path):
-    if dst.exists() or dst.is_symlink():
-        dst.unlink()
-    os.symlink(src.resolve(), dst)
-
-
 def axis_convention_matrix(name: str):
     if name == "identity":
         return np.eye(3, dtype=np.float64)
@@ -323,9 +293,21 @@ def axis_convention_matrix(name: str):
     raise ValueError(f"Convention d'axes inconnue: {name}")
 
 
-def touch_if_missing(path: Path):
-    if not path.exists():
-        path.touch()
+def run_decompression_script(script_path: Path, input_dir: Path, output_dir: Path,
+                             factor: float, jpeg_quality: int, verbose: int):
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--input-dir", str(input_dir),
+        "--output-dir", str(output_dir),
+        "--factor", str(factor),
+        "--jpg",
+        "--jpeg-quality", str(jpeg_quality),
+    ]
+    if verbose >= 1:
+        cmd.append("--verbose")
+
+    subprocess.run(cmd, check=True)
 
 
 def main():
@@ -337,6 +319,9 @@ def main():
     ap.add_argument("--images", required=True, help="Dossier des images source")
     ap.add_argument("--out", required=True, help="Dossier de sortie")
     ap.add_argument("--subsample", type=int, default=10, help="Facteur de sous-échantillonnage du LAZ")
+    ap.add_argument("--image-factor", type=float, default=1.0,
+                    help="Facteur de sous-échantillonnage des images (2 = largeur/hauteur divisées par 2)")
+    ap.add_argument("--jpeg-quality", type=int, default=95, help="Qualité JPEG de sortie")
     ap.add_argument("--assume-camera-to-world", action="store_true",
                     help="Interprète le quaternion XML comme caméra->monde")
     ap.add_argument("--axis-convention", default="identity",
@@ -351,6 +336,12 @@ def main():
     images_dir = Path(args.images)
     out_dir = Path(args.out)
 
+    script_dir = Path(__file__).resolve().parent
+    decompression_script = script_dir / "decompression-jp2.py"
+
+    if not decompression_script.exists():
+        raise FileNotFoundError(f"Script introuvable: {decompression_script}")
+
     out_images = out_dir / "colmap" / "images"
     out_colmap = out_dir / "colmap"
     out_sparse = out_colmap / "sparse" / "0"
@@ -359,7 +350,7 @@ def main():
     for d in [out_images, out_sparse, out_models_0]:
         ensure_dir(d)
 
-    log("[1/8] Indexation des images existantes...", 1, args.verbose)
+    log("[1/9] Indexation des images existantes...", 1, args.verbose)
     image_index = build_image_index(images_dir)
     log(f"  {len(image_index)} images indexées.", 1, args.verbose)
 
@@ -367,35 +358,61 @@ def main():
         print("Aucune image compatible trouvée dans le dossier fourni.")
         sys.exit(2)
 
-    log("[2/8] Lecture streaming des paramètres capteur...", 1, args.verbose)
+    log("[2/9] Lecture streaming des paramètres capteur...", 1, args.verbose)
     sensor = parse_sensor_streaming(xml_path)
-    width = sensor["width"]
-    height = sensor["height"]
-    fx = sensor["fx"]
-    fy = sensor["fy"]
-    cx = sensor["cx"]
-    cy = sensor["cy"]
+
+    width0 = sensor["width"]
+    height0 = sensor["height"]
+    fx0 = sensor["fx"]
+    fy0 = sensor["fy"]
+    cx0 = sensor["cx"]
+    cy0 = sensor["cy"]
+
+    factor = max(float(args.image_factor), 1.0)
+
+    width = max(1, int(width0 / factor))
+    height = max(1, int(height0 / factor))
+    fx = fx0 / factor
+    fy = fy0 / factor
+    cx = cx0 / factor
+    cy = cy0 / factor
 
     log(f"  Capteur: {sensor.get('sensor_name')}", 1, args.verbose)
-    log(f"  Taille: {width}x{height}", 1, args.verbose)
-    log(f"  Focale: {sensor.get('focal_mm'):.3f} mm", 1, args.verbose)
-    log(f"  Focale px: ({fx:.3f}, {fy:.3f})", 1, args.verbose)
-    log(f"  Point principal: ({cx:.3f}, {cy:.3f})", 1, args.verbose)
+    log(f"  Taille native: {width0}x{height0}", 1, args.verbose)
+    log(f"  Taille exportée: {width}x{height}", 1, args.verbose)
+    log(f"  Focale px native: ({fx0:.3f}, {fy0:.3f})", 1, args.verbose)
+    log(f"  Focale px exportée: ({fx:.3f}, {fy:.3f})", 1, args.verbose)
+    log(f"  Point principal exporté: ({cx:.3f}, {cy:.3f})", 1, args.verbose)
+
+    log("[3/9] Décompression + sous-échantillonnage des images...", 1, args.verbose)
+    run_decompression_script(
+        script_path=decompression_script,
+        input_dir=images_dir,
+        output_dir=out_images,
+        factor=factor,
+        jpeg_quality=args.jpeg_quality,
+        verbose=args.verbose,
+    )
+
+    decompressed_index = build_image_index(out_images)
+    log(f"  {len(decompressed_index)} images exportées indexées.", 1, args.verbose)
 
     axis_conv = axis_convention_matrix(args.axis_convention)
 
-    log("[3/8] Lecture streaming des clichés valides...", 1, args.verbose)
+    log("[4/9] Lecture streaming des clichés valides...", 1, args.verbose)
     frames = []
     num_found = 0
 
     for idx, item in enumerate(iter_cliches_streaming(xml_path, image_index, verbose=args.verbose)):
         num_found += 1
 
-        src_ext = Path(item["image_path"]).suffix
-        frame_name = f"frame_{idx:05d}{src_ext}"
+        src_stem = item["image_path"].stem
+        exported_img = decompressed_index.get(src_stem)
+        if exported_img is None:
+            log(f"[WARN] Image exportée absente après décompression: {src_stem}", 2, args.verbose)
+            continue
 
-        dst_img = out_images / frame_name
-        link_symlink(item["image_path"], dst_img)
+        frame_name = exported_img.name
 
         qvec, tvec, R_cw = pose_xml_to_colmap(
             item["quat_xyzw"],
@@ -424,26 +441,22 @@ def main():
         print("Aucun cliché valide trouvé: images absentes ou poses incomplètes.")
         sys.exit(3)
 
-    log("[4/8] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
+    log("[5/9] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
     pts_xyz, pts_rgb = read_laz_points(laz_path, args.subsample)
     log(f"  {len(pts_xyz)} points conservés.", 1, args.verbose)
 
-    log("[5/8] Écriture cameras.txt...", 1, args.verbose)
+    log("[6/9] Écriture cameras.txt...", 1, args.verbose)
     write_cameras_txt(out_sparse / "cameras.txt", width, height, fx, fy, cx, cy)
 
-    log("[6/8] Écriture images.txt et points3D.txt...", 1, args.verbose)
+    log("[7/9] Écriture images.txt et points3D.txt...", 1, args.verbose)
     write_images_txt(out_sparse / "images.txt", frames)
     write_points3D_txt(out_sparse / "points3D.txt", pts_xyz, pts_rgb)
 
-    log("[7/8] Export transforms.json...", 1, args.verbose)
-    # write_ply(out_dir / "sparse_pc.ply", pts_xyz, pts_rgb)
+    log("[8/9] Export transforms.json...", 1, args.verbose)
     build_transforms_json(out_colmap / "transforms.json", frames, width, height, fx, fy, cx, cy)
 
-    log("[8/8] Conversion binaire optionnelle...", 1, args.verbose)
+    log("[9/9] Conversion binaire optionnelle...", 1, args.verbose)
     try_write_colmap_bin(out_sparse, args.verbose)
-
-    # touch_if_missing(out_sparse / "database.db")
-    # touch_if_missing(out_sparse / "frames.bin")
 
     print("\nTerminé.")
     print(f"Sortie: {out_dir}")
