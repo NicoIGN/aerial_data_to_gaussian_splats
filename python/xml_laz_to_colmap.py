@@ -337,7 +337,7 @@ def main():
     out_dir = Path(args.out)
 
     script_dir = Path(__file__).resolve().parent
-    decompression_script = script_dir / "decompression-jp2.py"
+    decompression_script = script_dir / "decompress-jp2.py"
 
     if not decompression_script.exists():
         raise FileNotFoundError(f"Script introuvable: {decompression_script}")
