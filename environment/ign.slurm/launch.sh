@@ -96,10 +96,10 @@ if [ "$VERBOSE" = "true" ]; then
 else
   log "Verbose mode disabled → filtered logs"
 
-  tail -n +1 -f "$STDOUT_LOG" "$STDERR_LOG" 2>/dev/null \
-    | grep -vE \
-'RESOURCE SNAPSHOT|memory\.total|memory\.used|memory\.free|utilization\.gpu|used_gpu_memory|^Mem:|^Swap:|^pid, process_name|^index, name|^\[INFO\]|^\[DEBUG\]|^INFO:|^DEBUG:|it/s|step=|epoch=|loss=|Loading|Saving|Caching|Downloading|Analyzing|Processing|Rendering|Iteration|Checkpoint|Progress|^==> .* <==$' \
-    || true &
+    tail -n +1 -f "$STDOUT_LOG" "$STDERR_LOG" 2>/dev/null \
+      | grep -vE \
+    'RESOURCE SNAPSHOT|memory\.total|memory\.used|memory\.free|utilization\.gpu|used_gpu_memory|^Mem:|^Swap:|^pid, process_name|^index, name|^==> .* <==$|[0-9]+(\.[0-9]+)?it/s|step=[0-9]+|epoch=[0-9]+|loss=' \
+      || true &
 fi
 
 TAIL_PID=$!
@@ -111,8 +111,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Attendre la fin du job Slurm
+POLL_INTERVAL=2
+[ "$VERBOSE" = "false" ] && POLL_INTERVAL=300
+
 while squeue -j "$JOB_ID" -h | grep -q .; do
-  sleep 2
+  sleep "$POLL_INTERVAL"
 done
 
 kill "$TAIL_PID" 2>/dev/null || true
