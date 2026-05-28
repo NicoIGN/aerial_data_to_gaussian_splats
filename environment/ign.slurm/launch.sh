@@ -112,7 +112,6 @@ trap cleanup EXIT INT TERM
 
 # Attendre la fin du job Slurm
 POLL_INTERVAL=2
-[ "$VERBOSE" = "false" ] && POLL_INTERVAL=300
 
 while squeue -j "$JOB_ID" -h | grep -q .; do
   sleep "$POLL_INTERVAL"
