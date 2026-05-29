@@ -227,7 +227,7 @@ fi
 ############################
 
 if [ -z "${STEPS_PER_SAVE+x}" ]; then
-  STEPS_PER_SAVE=2000
+  STEPS_PER_SAVE=5000
 fi
 
 if [ -z "${STEPS_PER_EVAL_ALL_IMAGES+x}" ]; then
