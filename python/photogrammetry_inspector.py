@@ -1111,22 +1111,21 @@ class InspectorApp:
             self.scene_widget.scene.add_geometry("pointcloud", pcd, mat)
 
         if self.state["show_cameras"]:
-            base_scale = self._estimate_camera_scale()
+            # Nouveau : on n'utilise plus _estimate_camera_scale() du tout
+            current_base_width = self.frustum_basewidth * self.state["frustum_scale"]
+            current_depth = self.frustum_depth * self.state["frustum_scale"]
+
             for image_id, im in sorted(self.colmap_images.items()):
                 T_wc = build_T_wc_from_colmap_image(im)
-
                 cam = self.colmap_cameras.get(im["camera_id"])
                 aspect = 1.0
                 if cam is not None and cam["height"] > 0:
                     aspect = cam["width"] / cam["height"]
 
-                cam_scale_world = base_scale * self.state["frustum_scale"]
-
-                # Taille de base = self.frustum_basewidth ; profondeur self.frustum_depth
                 frustum = create_camera_frustum(
                     T_wc,
-                    depth=self.frustum_depth,
-                    base_width=self.frustum_basewidth * self.state["frustum_scale"],
+                    depth=current_depth,
+                    base_width=current_base_width,
                     aspect=aspect,
                     color=(1.0, 0.0, 0.0),
                 )
@@ -1145,11 +1144,11 @@ class InspectorApp:
                             w, h = img.size
                         if h > 0 and w > 0:
                             aspect = w / h
-                        
+
                         quad = create_textured_image_quad(
                             T_wc,
-                            depth=self.frustum_depth,
-                            base_width=self.frustum_basewidth * self.state["frustum_scale"],
+                            depth=current_depth,
+                            base_width=current_base_width,
                             aspect=aspect,
                         )
 
