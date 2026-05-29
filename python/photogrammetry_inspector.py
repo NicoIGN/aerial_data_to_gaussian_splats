@@ -60,17 +60,16 @@ def build_T_wc_from_colmap_image(colmap_image):
     T_wc[:3, 3] = C
     return T_wc
 
-
-def create_camera_frustum(T_wc, scale=1.0, aspect=1.0, color=(1.0, 0.0, 0.0)):
-    half_w = scale / 2.0
-    half_h = (scale / max(aspect, 1e-12)) / 2.0
+def create_camera_frustum(T_wc, depth, base_width, aspect=1.0, color=(1.0, 0.0, 0.0)):
+    half_w = base_width / 2.0
+    half_h = half_w / max(aspect, 1e-12)
 
     pts_cam = np.array([
-        [0.0, 0.0, 0.0],
-        [-half_w, -half_h, scale],
-        [half_w, -half_h, scale],
-        [half_w, half_h, scale],
-        [-half_w, half_h, scale],
+        [0.0, 0.0, 0.0],           # sommet optique (caméra)
+        [-half_w, -half_h, depth], # base coin 1
+        [ half_w, -half_h, depth], # base coin 2
+        [ half_w,  half_h, depth], # base coin 3
+        [-half_w,  half_h, depth], # base coin 4
     ], dtype=np.float64)
 
     R_wc = T_wc[:3, :3]
@@ -83,22 +82,22 @@ def create_camera_frustum(T_wc, scale=1.0, aspect=1.0, color=(1.0, 0.0, 0.0)):
     ]
     colors = np.tile(np.array(color, dtype=np.float64), (len(lines), 1))
 
+    import open3d as o3d
     frustum = o3d.geometry.LineSet()
     frustum.points = o3d.utility.Vector3dVector(pts_world)
     frustum.lines = o3d.utility.Vector2iVector(lines)
     frustum.colors = o3d.utility.Vector3dVector(colors)
     return frustum
 
-
-def create_textured_image_quad(T_wc, scale=1.0, aspect=1.0):
-    half_w = scale / 2.0
-    half_h = (scale / max(aspect, 1e-12)) / 2.0
+def create_textured_image_quad(T_wc, depth, base_width, aspect=1.0):
+    half_w = base_width / 2.0
+    half_h = half_w / max(aspect, 1e-12)
 
     verts_cam = np.array([
-        [-half_w, half_h, scale],
-        [half_w, half_h, scale],
-        [half_w, -half_h, scale],
-        [-half_w, -half_h, scale],
+        [-half_w,  half_h, depth],
+        [ half_w,  half_h, depth],
+        [ half_w, -half_h, depth],
+        [-half_w, -half_h, depth],
     ], dtype=np.float64)
 
     triangles = np.array([
@@ -701,12 +700,12 @@ class InspectorApp:
         self._camera_geom_names = []
         self._camera_image_geom_names = []
 
-        self.camera_default_scale, self.camera_scale_min, self.camera_scale_max = (
-            self._compute_camera_scale_defaults()
-        )
+        # -- Initialisation du frustum (échelle physique + bornes slider)
+        self.frustum_depth, self.frustum_basewidth, self.camera_scale_min, self.camera_scale_max = self._compute_camera_scale_defaults()
 
+        # Le slider contrôle un facteur multiplicatif appliqué à frustum_basewidth.
         if frustum_scale is None:
-            frustum_scale = self.camera_default_scale
+            frustum_scale = 1.0
 
         self.app = gui.Application.instance
         self.app.initialize()
@@ -783,11 +782,10 @@ class InspectorApp:
 
         self.state = {
             "point_size": float(point_size),
-            "frustum_scale": float(frustum_scale),
+            "frustum_scale": float(frustum_scale),  # Multiplicatif sur la largeur du frustum
             "show_pointcloud": True,
             "show_cameras": True,
-            
-            # pending = seule source des sliders
+
             "point_size_pending": float(point_size),
             "frustum_scale_pending": float(frustum_scale),
         }
@@ -802,42 +800,44 @@ class InspectorApp:
         self._populate_scene()
         self._install_interaction_handlers()
         self._refresh_image_list_for_selection()
+        self._on_recenter()
 
     def _compute_camera_scale_defaults(self):
-        centers = []
-        for im in self.colmap_images.values():
-            T_wc = build_T_wc_from_colmap_image(im)
-            centers.append(T_wc[:3, 3])
+        import numpy as np
 
+        centers = [build_T_wc_from_colmap_image(im)[:3, 3] for im in self.colmap_images.values()]
         if len(centers) < 2:
-            return 0.1, 0.02, 0.5
+            print("[CAMSCALE] Trop peu de centres de caméras, fallback.")
+            return 1.0, 1.0, 0.2, 4.0
 
         centers = np.asarray(centers, dtype=np.float64)
+        scene_center = centers.mean(axis=0)
+        dists = np.linalg.norm(centers - scene_center, axis=1)
+        max_dist = np.max(dists)
+        print(f"[CAMSCALE] scene_center={scene_center} max_dist={max_dist:.6f}")
 
-        dists = []
-        for i in range(len(centers)):
-            diff = centers - centers[i]
-            dist = np.linalg.norm(diff, axis=1)
-            dist = dist[dist > 1e-9]
-            if len(dist) > 0:
-                dists.append(np.min(dist))
+        # Frustum: fond de chambre à 10% du rayon max
+        depth = 0.10 * max_dist
+        angle_deg = 45.0
+        half_angle_rad = np.deg2rad(angle_deg / 2.0)
+        base_width = 2.0 * depth * np.tan(half_angle_rad)
 
-        if not dists:
-            return 0.1, 0.02, 0.5
+        # Valeurs sliders
+        min_scale = max(base_width * 0.2, 1e-6)
+        max_scale = base_width * 4.0
 
-        mean_spacing = float(np.mean(dists))
-
-        default_scale = max(mean_spacing * 0.25, 1e-4)
-        min_scale = max(mean_spacing * 0.05, 1e-5)
-        max_scale = max(mean_spacing * 1.5, min_scale * 2.0)
+        print(f"[CAMSCALE] FOND CHAMBRE : depth={depth:.6f}m (10% du rayon max scène)")
+        print(f"[CAMSCALE] angle sommet frustum={angle_deg:.2f}°, base_width={base_width:.6f}")
+        print(f"[CAMSCALE] min_scale={min_scale:.6f} max_scale={max_scale:.6f}")
 
         dbg(
-            f"Camera spacing mean={mean_spacing:.6f}, default={default_scale:.6f}, "
-            f"min={min_scale:.6f}, max={max_scale:.6f}",
-            self.verbose,
+            f"[CAMSCALE] centre={scene_center} max_dist={max_dist:.3f} "
+            f"depth={depth:.3f} (fond chambre) "
+            f"angle={angle_deg:.1f} base_w={base_width:.3f} min={min_scale:.3f} max={max_scale:.3f}",
+            self.verbose
         )
 
-        return default_scale, min_scale, max_scale
+        return depth, base_width, min_scale, max_scale
 
     def _build_ui(self):
         self.left_panel.add_child(gui.Label("Scène 3D"))
@@ -868,7 +868,7 @@ class InspectorApp:
 
 
         self.left_panel.add_child(gui.Label(
-            f"Défaut={self.camera_default_scale:.3f} | min={self.camera_scale_min:.3f} | max={self.camera_scale_max:.3f}"
+            f"Défaut={self.frustum_basewidth:.3f} | min={self.camera_scale_min:.3f} | max={self.camera_scale_max:.3f}"
         ))
 
         
@@ -1122,12 +1122,15 @@ class InspectorApp:
 
                 cam_scale_world = base_scale * self.state["frustum_scale"]
 
+                # Taille de base = self.frustum_basewidth ; profondeur self.frustum_depth
                 frustum = create_camera_frustum(
                     T_wc,
-                    scale=cam_scale_world,
+                    depth=self.frustum_depth,
+                    base_width=self.frustum_basewidth * self.state["frustum_scale"],
                     aspect=aspect,
                     color=(1.0, 0.0, 0.0),
                 )
+
                 name = f"cam_{image_id}"
                 mat_line = rendering.MaterialRecord()
                 mat_line.shader = "unlitLine"
@@ -1142,10 +1145,11 @@ class InspectorApp:
                             w, h = img.size
                         if h > 0 and w > 0:
                             aspect = w / h
-
+                        
                         quad = create_textured_image_quad(
                             T_wc,
-                            scale=cam_scale_world,
+                            depth=self.frustum_depth,
+                            base_width=self.frustum_basewidth * self.state["frustum_scale"],
                             aspect=aspect,
                         )
 
