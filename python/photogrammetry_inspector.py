@@ -156,14 +156,16 @@ def load_3dpoints(colmap_dir: Path):
         ids = []
         points = []
         colors = []
+        observations = {}
 
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
+
                 parts = line.split()
-                if len(parts) < 7:
+                if len(parts) < 8:
                     continue
 
                 pid = int(parts[0])
@@ -178,24 +180,51 @@ def load_3dpoints(colmap_dir: Path):
                 points.append([x, y, z])
                 colors.append([r / 255.0, g / 255.0, b / 255.0])
 
+                # Track COLMAP : IMAGE_ID POINT2D_IDX IMAGE_ID POINT2D_IDX ...
+                image_ids = []
+                track_parts = parts[8:]
+
+                for i in range(0, len(track_parts), 2):
+                    if i + 1 >= len(track_parts):
+                        break
+
+                    image_id = int(track_parts[i])
+                    image_ids.append(image_id)
+
+                observations[pid] = {
+                    "image_ids": image_ids
+                }
+
         pcd = o3d.geometry.PointCloud()
+
         if points:
-            pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
-            pcd.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
+            pcd.points = o3d.utility.Vector3dVector(
+                np.asarray(points, dtype=np.float64)
+            )
+            pcd.colors = o3d.utility.Vector3dVector(
+                np.asarray(colors, dtype=np.float64)
+            )
 
         return {
             "pcd": pcd,
             "point_ids": np.asarray(ids, dtype=np.int64),
-            "xyz": np.asarray(points, dtype=np.float64) if points else np.zeros((0, 3), dtype=np.float64),
+            "xyz": (
+                np.asarray(points, dtype=np.float64)
+                if points
+                else np.zeros((0, 3), dtype=np.float64)
+            ),
+            "observations": observations,
         }
 
     def _load_bin(path: Path):
         ids = []
         points = []
         colors = []
+        observations = {}
 
         with open(path, "rb") as f:
             num_points_data = f.read(8)
+
             if len(num_points_data) != 8:
                 raise ValueError("Fichier points3D.bin invalide ou vide")
 
@@ -208,7 +237,13 @@ def load_3dpoints(colmap_dir: Path):
                 error_data = f.read(8)
                 track_len_data = f.read(8)
 
-                if len(point3d_id_data) != 8 or len(xyz_data) != 24 or len(rgb_data) != 3 or len(error_data) != 8 or len(track_len_data) != 8:
+                if (
+                    len(point3d_id_data) != 8
+                    or len(xyz_data) != 24
+                    or len(rgb_data) != 3
+                    or len(error_data) != 8
+                    or len(track_len_data) != 8
+                ):
                     raise ValueError("Fichier points3D.bin tronqué")
 
                 point3d_id = struct.unpack("<Q", point3d_id_data)[0]
@@ -217,23 +252,40 @@ def load_3dpoints(colmap_dir: Path):
                 _error = struct.unpack("<d", error_data)[0]
                 track_length = struct.unpack("<Q", track_len_data)[0]
 
-                track_bytes = f.read(track_length * 8)
-                if len(track_bytes) != track_length * 8:
-                    raise ValueError("Fichier points3D.bin tronqué dans les tracks")
+                image_ids = []
+
+                for _ in range(track_length):
+                    image_id = struct.unpack("<I", f.read(4))[0]
+                    _point2d_idx = struct.unpack("<I", f.read(4))[0]
+                    image_ids.append(image_id)
+
+                observations[point3d_id] = {
+                    "image_ids": image_ids
+                }
 
                 ids.append(point3d_id)
                 points.append([x, y, z])
                 colors.append([r / 255.0, g / 255.0, b / 255.0])
 
         pcd = o3d.geometry.PointCloud()
+
         if points:
-            pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
-            pcd.colors = o3d.utility.Vector3dVector(np.asarray(colors, dtype=np.float64))
+            pcd.points = o3d.utility.Vector3dVector(
+                np.asarray(points, dtype=np.float64)
+            )
+            pcd.colors = o3d.utility.Vector3dVector(
+                np.asarray(colors, dtype=np.float64)
+            )
 
         return {
             "pcd": pcd,
             "point_ids": np.asarray(ids, dtype=np.int64),
-            "xyz": np.asarray(points, dtype=np.float64) if points else np.zeros((0, 3), dtype=np.float64),
+            "xyz": (
+                np.asarray(points, dtype=np.float64)
+                if points
+                else np.zeros((0, 3), dtype=np.float64)
+            ),
+            "observations": observations,
         }
 
     candidate_paths = [
@@ -246,11 +298,16 @@ def load_3dpoints(colmap_dir: Path):
     for path in candidate_paths:
         if path.exists():
             info(f"Chargement des points 3D COLMAP : {path}")
+
             if path.suffix.lower() == ".bin":
                 return _load_bin(path)
+
             return _load_txt(path)
 
-    raise FileNotFoundError("Impossible de trouver points3D.bin ou points3D.txt")
+    raise FileNotFoundError(
+        "Impossible de trouver points3D.bin ou points3D.txt"
+    )
+
 
 
 def load_colmap_images(colmap_dir: Path):
@@ -620,12 +677,16 @@ def draw_zoomed_projections_on_image(image_path: Path, uv_fullres, full_w, full_
 
 
 class InspectorApp:
-    def __init__(self, lidar_data, colmap_images, colmap_cameras,
+    def __init__(self, pointcloud_data, colmap_images, colmap_cameras,
                  colmap_dir: Path, point_size=2.0, frustum_scale=None, verbose=False):
-        self.lidar_data = lidar_data
-        self.raw_lidar = o3d.geometry.PointCloud(lidar_data["pcd"])
-        self.points_xyz = lidar_data["xyz"]
-        self.point_ids = lidar_data["point_ids"]
+
+        self.pointcloud_data = pointcloud_data
+        self.raw_pointcloud = o3d.geometry.PointCloud(pointcloud_data["pcd"])
+        self.points_xyz = pointcloud_data["xyz"]
+        self.point_ids = pointcloud_data["point_ids"]
+
+        # NEW: mapping point3D_id -> [image_id, ...]
+        self.point_observations = pointcloud_data.get("observations", {})
 
         self.colmap_images = colmap_images
         self.colmap_cameras = colmap_cameras
@@ -636,10 +697,13 @@ class InspectorApp:
         self.selected_point_index = None
         self.selected_point_xyz = None
         self.selected_sphere_name = "selected_point_marker"
+
         self._camera_geom_names = []
         self._camera_image_geom_names = []
 
-        self.camera_default_scale, self.camera_scale_min, self.camera_scale_max = self._compute_camera_scale_defaults()
+        self.camera_default_scale, self.camera_scale_min, self.camera_scale_max = (
+            self._compute_camera_scale_defaults()
+        )
 
         if frustum_scale is None:
             frustum_scale = self.camera_default_scale
@@ -647,30 +711,58 @@ class InspectorApp:
         self.app = gui.Application.instance
         self.app.initialize()
 
-        self.window = self.app.create_window("Inspection photogrammétrique", 1900, 1080)
+        self.window = self.app.create_window(
+            "Inspection photogrammétrique",
+            1900,
+            1080
+        )
+
         self.em = self.window.theme.font_size
         self.margin = 0.5 * self.em
 
         self.scene_widget = gui.SceneWidget()
-        self.scene_widget.scene = rendering.Open3DScene(self.window.renderer)
-        self.scene_widget.scene.set_background([0.08, 0.08, 0.08, 1.0])
+        self.scene_widget.scene = rendering.Open3DScene(
+            self.window.renderer
+        )
+        self.scene_widget.scene.set_background(
+            [0.08, 0.08, 0.08, 1.0]
+        )
 
         self.left_panel = gui.Vert(
             0.25 * self.em,
-            gui.Margins(self.margin, self.margin, self.margin, self.margin)
+            gui.Margins(
+                self.margin,
+                self.margin,
+                self.margin,
+                self.margin
+            )
         )
 
         self.right_panel_background = gui.Vert(
             0.25 * self.em,
-            gui.Margins(self.margin, self.margin, self.margin, self.margin)
+            gui.Margins(
+                self.margin,
+                self.margin,
+                self.margin,
+                self.margin
+            )
         )
 
-        self.right_title = gui.Label("Images contenant le point sélectionné")
-        self.right_panel_background.add_child(self.right_title)
+        self.right_title = gui.Label(
+            "Images contenant le point sélectionné"
+        )
+        self.right_panel_background.add_child(
+            self.right_title
+        )
 
         self.right_panel = gui.ScrollableVert(
             0.25 * self.em,
-            gui.Margins(self.margin, self.margin, self.margin, self.margin)
+            gui.Margins(
+                self.margin,
+                self.margin,
+                self.margin,
+                self.margin
+            )
         )
 
         self.right_items_layout = gui.VGrid(
@@ -678,8 +770,13 @@ class InspectorApp:
             0.35 * self.em,
             gui.Margins(0, 0, 0, 0)
         )
-        self.right_panel.add_child(self.right_items_layout)
-        self.right_panel_background.add_child(self.right_panel)
+
+        self.right_panel.add_child(
+            self.right_items_layout
+        )
+        self.right_panel_background.add_child(
+            self.right_panel
+        )
 
         self.panel_width = int(22 * self.em)
         self.right_width = int(42 * self.em)
@@ -690,6 +787,12 @@ class InspectorApp:
             "show_pointcloud": True,
             "show_cameras": True,
         }
+
+        dbg(
+            f"Point observations chargées: "
+            f"{len(self.point_observations)} points trackés",
+            self.verbose,
+        )
 
         self._build_ui()
         self._populate_scene()
@@ -763,15 +866,17 @@ class InspectorApp:
             f"Défaut={self.camera_default_scale:.3f} | min={self.camera_scale_min:.3f} | max={self.camera_scale_max:.3f}"
         ))
 
+
+        self.recenter_button = gui.Button("Recentrer la vue")
+        self.recenter_button.set_on_clicked(self._on_recenter)
+        self.left_panel.add_child(self.recenter_button)
+        
         self.left_panel.add_child(gui.Label("Sélection"))
         self.left_panel.add_child(gui.Label("Clic: point visible le plus proche (buffer Z)"))
 
         self.selection_label = gui.Label("Aucun point sélectionné")
         self.left_panel.add_child(self.selection_label)
 
-        self.recenter_button = gui.Button("Recentrer la vue")
-        self.recenter_button.set_on_clicked(self._on_recenter)
-        self.left_panel.add_child(self.recenter_button)
 
         self.window.add_child(self.left_panel)
         self.window.add_child(self.scene_widget)
@@ -960,13 +1065,13 @@ class InspectorApp:
 
         self.scene_widget.set_on_mouse(_on_mouse)
 
-    def _build_colored_lidar(self):
-        pcd = o3d.geometry.PointCloud(self.raw_lidar)
+    def _build_colored_pointcloud(self):
+        pcd = o3d.geometry.PointCloud(self.raw_pointcloud)
         return colorize_point_cloud_by_z(pcd)
 
     def _populate_scene(self):
         try:
-            self.scene_widget.scene.remove_geometry("lidar")
+            self.scene_widget.scene.remove_geometry("pointcloud")
         except Exception:
             pass
 
@@ -990,11 +1095,11 @@ class InspectorApp:
             pass
 
         if self.state["show_pointcloud"]:
-            pcd = self._build_colored_lidar()
+            pcd = self._build_colored_pointcloud()
             mat = rendering.MaterialRecord()
             mat.shader = "defaultUnlit"
             mat.point_size = self.state["point_size"]
-            self.scene_widget.scene.add_geometry("lidar", pcd, mat)
+            self.scene_widget.scene.add_geometry("pointcloud", pcd, mat)
 
         if self.state["show_cameras"]:
             base_scale = self._estimate_camera_scale()
@@ -1279,49 +1384,133 @@ class InspectorApp:
 
         if self.selected_point_xyz is None:
             info("Aucun point sélectionné: aucune image à afficher.")
-            self.right_items_layout.add_child(gui.Label("Aucun point sélectionné."))
+            self.right_items_layout.add_child(
+                gui.Label("Aucun point sélectionné.")
+            )
             return
 
-        info("Recherche des images projectables pour 1 point")
+        if self.selected_point_index is None:
+            warn("selected_point_index=None")
+            return
+
+        point_id = int(self.point_ids[self.selected_point_index])
+
+        obs = self.point_observations.get(point_id)
+
+        candidate_image_ids = (
+            obs.get("image_ids", [])
+            if obs is not None
+            else []
+        )
+
+        info(
+            f"Recherche des images contenant "
+            f"point_id={point_id} "
+            f"({len(candidate_image_ids)} candidate(s))"
+        )
 
         projections_per_image = []
 
-        for image_id, colmap_image in self.colmap_images.items():
-            cam = self.colmap_cameras.get(colmap_image["camera_id"])
+        if not candidate_image_ids:
+            warn(
+                f"Aucune observation COLMAP "
+                f"pour point_id={point_id}"
+            )
+            self.right_items_layout.add_child(
+                gui.Label(
+                    "Aucune image ne contient ce point."
+                )
+            )
+            return
+
+        for image_id in candidate_image_ids:
+
+            colmap_image = self.colmap_images.get(
+                image_id
+            )
+
+            if colmap_image is None:
+                warn(
+                    f"Image COLMAP absente: "
+                    f"image_id={image_id}"
+                )
+                continue
+
+            cam = self.colmap_cameras.get(
+                colmap_image["camera_id"]
+            )
+
             if cam is None:
-                warn(f"Caméra introuvable pour image_id={image_id}")
+                warn(
+                    f"Caméra introuvable "
+                    f"pour image_id={image_id}"
+                )
                 continue
 
             image_name = colmap_image["name"]
-            dbg(f"Test image COLMAP: id={image_id}, name={image_name}", self.verbose)
 
-            image_path = resolve_image_path(self.images_dir, image_name, verbose=self.verbose)
+            dbg(
+                f"Test image trackée: "
+                f"id={image_id}, "
+                f"name={image_name}",
+                self.verbose,
+            )
+
+            image_path = resolve_image_path(
+                self.images_dir,
+                image_name,
+                verbose=self.verbose,
+            )
+
             if image_path is None:
-                warn(f"Image non trouvée dans images/: {image_name}")
+                warn(
+                    f"Image non trouvée "
+                    f"dans images/: {image_name}"
+                )
                 continue
 
-            dbg(f"Image résolue: {image_path}", self.verbose)
+            dbg(
+                f"Image résolue: {image_path}",
+                self.verbose,
+            )
 
             try:
-                proj = project_world_point(colmap_image, cam, self.selected_point_xyz)
+                proj = project_world_point(
+                    colmap_image,
+                    cam,
+                    self.selected_point_xyz,
+                )
+
             except NotImplementedError as e:
-                warn(f"Projection non supportée pour {image_name}: {e}")
+                warn(
+                    f"Projection non supportée "
+                    f"pour {image_name}: {e}"
+                )
                 proj = None
 
             if proj is None:
-                dbg("  projection=None", self.verbose)
+                dbg(
+                    "projection=None",
+                    self.verbose,
+                )
                 continue
 
+            # sécurité: normalement inutile car
+            # le point vient du track COLMAP
             if not proj["inside"]:
                 dbg(
-                    f"  hors image u={proj['uv'][0]:.2f}, v={proj['uv'][1]:.2f}, "
-                    f"w={proj['width']}, h={proj['height']}",
+                    f"Hors image "
+                    f"u={proj['uv'][0]:.2f}, "
+                    f"v={proj['uv'][1]:.2f}",
                     self.verbose,
                 )
                 continue
 
             dbg(
-                f"  dedans u={proj['uv'][0]:.2f}, v={proj['uv'][1]:.2f}, z={proj['depth']:.3f}",
+                f"Dedans "
+                f"u={proj['uv'][0]:.2f}, "
+                f"v={proj['uv'][1]:.2f}, "
+                f"z={proj['depth']:.3f}",
                 self.verbose,
             )
 
@@ -1335,27 +1524,57 @@ class InspectorApp:
                 "height": int(cam["height"]),
             })
 
-            info(f"Image retenue: {image_name} | projection valide")
+            info(
+                f"Image retenue: "
+                f"{image_name}"
+            )
 
-        projections_per_image.sort(key=lambda x: x["depth"])
+        projections_per_image.sort(
+            key=lambda x: x["depth"]
+        )
 
-        info(f"Nombre total d'images affichables: {len(projections_per_image)}")
+        info(
+            f"Nombre total d'images "
+            f"affichables: "
+            f"{len(projections_per_image)}"
+        )
 
         if not projections_per_image:
-            warn("Aucune image ne contient le point sélectionné, ou aucune image n'a été résolue dans images/")
+            warn(
+                "Aucune image exploitable "
+                "pour le point sélectionné"
+            )
+
             self.right_items_layout.add_child(
-                gui.Label("Aucune image ne contient le point sélectionné.")
+                gui.Label(
+                    "Aucune image ne contient "
+                    "le point sélectionné."
+                )
             )
             return
 
-        header = gui.Label(f"{len(projections_per_image)} image(s) correspondante(s)")
-        self.right_items_layout.add_child(header)
-        self.right_items_layout.add_child(gui.Label(""))
-        self.right_items_layout.add_child(gui.Label(""))
+        header = gui.Label(
+            f"{len(projections_per_image)} "
+            f"image(s) correspondante(s)"
+        )
 
-        cards = [self._make_image_card(item) for item in projections_per_image]
+        self.right_items_layout.add_child(
+            header
+        )
+        self.right_items_layout.add_child(
+            gui.Label("")
+        )
+        self.right_items_layout.add_child(
+            gui.Label("")
+        )
+
+        cards = [
+            self._make_image_card(item)
+            for item in projections_per_image
+        ]
 
         remainder = len(cards) % 3
+
         if remainder != 0:
             for _ in range(3 - remainder):
                 cards.append(gui.Label(""))
@@ -1365,7 +1584,6 @@ class InspectorApp:
 
     def run(self):
         self.app.run()
-
 
 def main():
     ap = argparse.ArgumentParser(description="Interface 3D/2D d'inspection photogrammétrique")
@@ -1388,12 +1606,16 @@ def main():
 
     info(f"Dossier images utilisé: {images_dir}")
 
-    lidar_data = load_3dpoints(colmap_dir)
+    pointcloud_data = load_3dpoints(colmap_dir)
+    info(
+        f"Observations chargées: "
+        f"{len(pointcloud_data.get('observations', {}))}"
+    )
     colmap_images = load_colmap_images(colmap_dir)
     colmap_cameras = load_colmap_cameras(colmap_dir)
 
     app = InspectorApp(
-        lidar_data=lidar_data,
+        pointcloud_data=pointcloud_data,
         colmap_images=colmap_images,
         colmap_cameras=colmap_cameras,
         colmap_dir=colmap_dir,
