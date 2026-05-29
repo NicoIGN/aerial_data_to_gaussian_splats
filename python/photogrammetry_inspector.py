@@ -786,6 +786,10 @@ class InspectorApp:
             "frustum_scale": float(frustum_scale),
             "show_pointcloud": True,
             "show_cameras": True,
+            
+            # pending = seule source des sliders
+            "point_size_pending": float(point_size),
+            "frustum_scale_pending": float(frustum_scale),
         }
 
         dbg(
@@ -862,11 +866,16 @@ class InspectorApp:
         self.frustum_slider.set_on_value_changed(self._on_frustum_scale_changed)
         self.left_panel.add_child(self.frustum_slider)
 
+
         self.left_panel.add_child(gui.Label(
             f"Défaut={self.camera_default_scale:.3f} | min={self.camera_scale_min:.3f} | max={self.camera_scale_max:.3f}"
         ))
 
-
+        
+        self.apply_button = gui.Button("Appliquer les nouvelles échelles")
+        self.apply_button.set_on_clicked(self._on_apply_settings)
+        self.left_panel.add_child(self.apply_button)
+        
         self.recenter_button = gui.Button("Recentrer la vue")
         self.recenter_button.set_on_clicked(self._on_recenter)
         self.left_panel.add_child(self.recenter_button)
@@ -1178,14 +1187,30 @@ class InspectorApp:
         pad = np.maximum((pmax - pmin) * 0.05, 1e-3)
 
         return o3d.geometry.AxisAlignedBoundingBox(pmin - pad, pmax + pad)
-
+        
     def _estimate_camera_scale(self):
-        if len(self.points_xyz) == 0:
+        if len(self.colmap_images) < 2:
             return 1.0
-        pmin = self.points_xyz.min(axis=0)
-        pmax = self.points_xyz.max(axis=0)
-        extent = np.max(pmax - pmin)
-        return max(0.01, 0.02 * extent)
+
+        centers = []
+        for im in self.colmap_images.values():
+            T_wc = build_T_wc_from_colmap_image(im)
+            centers.append(T_wc[:3, 3])
+
+        centers = np.asarray(centers, dtype=np.float64)
+
+        cmin = centers.min(axis=0)
+        cmax = centers.max(axis=0)
+
+        bbox_size = cmax - cmin
+        extent = np.linalg.norm(bbox_size)
+
+        if extent < 1e-9:
+            return 1.0
+
+        scale = extent * 0.5
+
+        return float(scale)
 
     def _set_selected_point(self, idx):
         idx = int(idx)
@@ -1238,11 +1263,15 @@ class InspectorApp:
         self._populate_scene()
 
     def _on_point_size_changed(self, value):
-        self.state["point_size"] = float(value)
-        self._populate_scene()
+        self.state["point_size_pending"] = float(value)
 
     def _on_frustum_scale_changed(self, value):
-        self.state["frustum_scale"] = float(value)
+        self.state["frustum_scale_pending"] = float(value)
+        
+    def _on_apply_settings(self):
+        self.state["point_size"] = self.state["point_size_pending"]
+        self.state["frustum_scale"] = self.state["frustum_scale_pending"]
+
         self._populate_scene()
 
     def _on_recenter(self):
