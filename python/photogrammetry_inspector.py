@@ -785,7 +785,7 @@ class InspectorApp:
             "frustum_scale": float(frustum_scale),  # Multiplicatif sur la largeur du frustum
             "show_pointcloud": True,
             "show_cameras": True,
-
+            "only_colmap_observations": True,
             "point_size_pending": float(point_size),
             "frustum_scale_pending": float(frustum_scale),
         }
@@ -840,26 +840,37 @@ class InspectorApp:
         return depth, base_width, min_scale, max_scale
 
     def _build_ui(self):
-        self.left_panel.add_child(gui.Label("Scène 3D"))
+        self.left_panel.add_child(gui.Label("3D scene"))
 
-        self.pointcloud_checkbox = gui.Checkbox("Afficher le nuage")
+        self.pointcloud_checkbox = gui.Checkbox("Display point cloud")
         self.pointcloud_checkbox.checked = True
         self.pointcloud_checkbox.set_on_checked(self._on_toggle_pointcloud)
         self.left_panel.add_child(self.pointcloud_checkbox)
 
-        self.camera_checkbox = gui.Checkbox("Afficher les caméras")
+        self.camera_checkbox = gui.Checkbox("Display cameras")
         self.camera_checkbox.checked = True
         self.camera_checkbox.set_on_checked(self._on_toggle_cameras)
         self.left_panel.add_child(self.camera_checkbox)
+        
+        self.colmap_obs_checkbox = gui.Checkbox(
+            "COLMAP observations only"
+        )
+        self.colmap_obs_checkbox.checked = True
+        self.colmap_obs_checkbox.set_on_checked(
+            self._on_toggle_colmap_observations
+        )
+        self.left_panel.add_child(
+            self.colmap_obs_checkbox
+        )
 
-        self.left_panel.add_child(gui.Label("Taille des points"))
+        self.left_panel.add_child(gui.Label("3D points size"))
         self.pointsize_slider = gui.Slider(gui.Slider.DOUBLE)
         self.pointsize_slider.set_limits(1.0, 10.0)
         self.pointsize_slider.double_value = self.state["point_size"]
         self.pointsize_slider.set_on_value_changed(self._on_point_size_changed)
         self.left_panel.add_child(self.pointsize_slider)
 
-        self.left_panel.add_child(gui.Label("Taille des caméras"))
+        self.left_panel.add_child(gui.Label("Camera size"))
         self.frustum_slider = gui.Slider(gui.Slider.DOUBLE)
         self.frustum_slider.set_limits(self.camera_scale_min, self.camera_scale_max)
         self.frustum_slider.double_value = self.state["frustum_scale"]
@@ -868,22 +879,22 @@ class InspectorApp:
 
 
         self.left_panel.add_child(gui.Label(
-            f"Défaut={self.frustum_basewidth:.3f} | min={self.camera_scale_min:.3f} | max={self.camera_scale_max:.3f}"
+            f"Default={self.frustum_basewidth:.3f} | min={self.camera_scale_min:.3f} | max={self.camera_scale_max:.3f}"
         ))
 
         
-        self.apply_button = gui.Button("Appliquer les nouvelles échelles")
+        self.apply_button = gui.Button("Apply new scales")
         self.apply_button.set_on_clicked(self._on_apply_settings)
         self.left_panel.add_child(self.apply_button)
         
-        self.recenter_button = gui.Button("Recentrer la vue")
+        self.recenter_button = gui.Button("Recenter view")
         self.recenter_button.set_on_clicked(self._on_recenter)
         self.left_panel.add_child(self.recenter_button)
         
-        self.left_panel.add_child(gui.Label("Sélection"))
-        self.left_panel.add_child(gui.Label("Clic: point visible le plus proche (buffer Z)"))
+        self.left_panel.add_child(gui.Label("Selection"))
+        self.left_panel.add_child(gui.Label("Clic: nearest visible point (buffer Z)"))
 
-        self.selection_label = gui.Label("Aucun point sélectionné")
+        self.selection_label = gui.Label("No selected point")
         self.left_panel.add_child(self.selection_label)
 
 
@@ -1264,6 +1275,10 @@ class InspectorApp:
     def _on_toggle_cameras(self, checked):
         self.state["show_cameras"] = bool(checked)
         self._populate_scene()
+        
+    def _on_toggle_colmap_observations(self, checked):
+        self.state["only_colmap_observations"] = bool(checked)
+        self._refresh_image_list_for_selection()
 
     def _on_point_size_changed(self, value):
         self.state["point_size_pending"] = float(value)
@@ -1427,19 +1442,33 @@ class InspectorApp:
 
         point_id = int(self.point_ids[self.selected_point_index])
 
-        obs = self.point_observations.get(point_id)
+        if self.state["only_colmap_observations"]:
 
-        candidate_image_ids = (
-            obs.get("image_ids", [])
-            if obs is not None
-            else []
-        )
+            obs = self.point_observations.get(point_id)
 
-        info(
-            f"Recherche des images contenant "
-            f"point_id={point_id} "
-            f"({len(candidate_image_ids)} candidate(s))"
-        )
+            candidate_image_ids = (
+                obs.get("image_ids", [])
+                if obs is not None
+                else []
+            )
+
+            info(
+                f"Mode observations COLMAP : "
+                f"point_id={point_id} "
+                f"({len(candidate_image_ids)} image(s))"
+            )
+
+        else:
+
+            candidate_image_ids = list(
+                self.colmap_images.keys()
+            )
+
+            info(
+                f"Mode toutes les images : "
+                f"point_id={point_id} "
+                f"({len(candidate_image_ids)} image(s) testées)"
+            )
 
         projections_per_image = []
 
