@@ -785,6 +785,7 @@ class InspectorApp:
             "frustum_scale": float(frustum_scale),  # Multiplicatif sur la largeur du frustum
             "show_pointcloud": True,
             "show_cameras": True,
+            "show_camera_images": True,
             "only_colmap_observations": True,
             "point_size_pending": float(point_size),
             "frustum_scale_pending": float(frustum_scale),
@@ -851,6 +852,17 @@ class InspectorApp:
         self.camera_checkbox.checked = True
         self.camera_checkbox.set_on_checked(self._on_toggle_cameras)
         self.left_panel.add_child(self.camera_checkbox)
+        
+        self.camera_images_checkbox = gui.Checkbox(
+            "Display images"
+        )
+        self.camera_images_checkbox.checked = True
+        self.camera_images_checkbox.set_on_checked(
+            self._on_toggle_camera_images
+        )
+        self.left_panel.add_child(
+            self.camera_images_checkbox
+        )
         
         self.colmap_obs_checkbox = gui.Checkbox(
             "COLMAP observations only"
@@ -1149,30 +1161,32 @@ class InspectorApp:
                 self._camera_geom_names.append(name)
 
                 image_path = resolve_image_path(self.images_dir, im["name"], verbose=self.verbose)
-                if image_path is not None:
-                    try:
-                        with Image.open(image_path) as img:
-                            w, h = img.size
-                        if h > 0 and w > 0:
-                            aspect = w / h
+                
+                if self.state["show_camera_images"]:
+                  if image_path is not None:
+                      try:
+                          with Image.open(image_path) as img:
+                              w, h = img.size
+                          if h > 0 and w > 0:
+                              aspect = w / h
 
-                        quad = create_textured_image_quad(
-                            T_wc,
-                            depth=current_depth,
-                            base_width=current_base_width,
-                            aspect=aspect,
-                        )
+                          quad = create_textured_image_quad(
+                              T_wc,
+                              depth=current_depth,
+                              base_width=current_base_width,
+                              aspect=aspect,
+                          )
 
-                        material = rendering.MaterialRecord()
-                        material.shader = "defaultUnlit"
-                        material.base_color = [1.0, 1.0, 1.0, 1.0]
-                        material.albedo_img = o3d.io.read_image(str(image_path))
+                          material = rendering.MaterialRecord()
+                          material.shader = "defaultUnlit"
+                          material.base_color = [1.0, 1.0, 1.0, 1.0]
+                          material.albedo_img = o3d.io.read_image(str(image_path))
 
-                        img_name = f"cam_img_{image_id}"
-                        self.scene_widget.scene.add_geometry(img_name, quad, material)
-                        self._camera_image_geom_names.append(img_name)
-                    except Exception as e:
-                        dbg(f"Impossible d'ajouter la preview caméra {im['name']}: {e}", self.verbose)
+                          img_name = f"cam_img_{image_id}"
+                          self.scene_widget.scene.add_geometry(img_name, quad, material)
+                          self._camera_image_geom_names.append(img_name)
+                      except Exception as e:
+                          dbg(f"Impossible d'ajouter la preview caméra {im['name']}: {e}", self.verbose)
 
         self._update_selection_geometry()
 
@@ -1274,6 +1288,10 @@ class InspectorApp:
 
     def _on_toggle_cameras(self, checked):
         self.state["show_cameras"] = bool(checked)
+        self._populate_scene()
+        
+    def _on_toggle_camera_images(self, checked):
+        self.state["show_camera_images"] = bool(checked)
         self._populate_scene()
         
     def _on_toggle_colmap_observations(self, checked):
