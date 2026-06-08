@@ -975,9 +975,9 @@ class InspectorApp:
         ))
 
 
-        self.left_panel.add_child(gui.Label(
-            f"Default={self.frustum_basewidth:.3f} | min={self.camera_scale_min:.3f} | max={self.camera_scale_max:.3f}"
-        ))
+        #self.left_panel.add_child(gui.Label(
+        #    f"Default={self.frustum_basewidth:.3f} | min={self.camera_scale_min:.3f} | max={self.camera_scale_max:.3f}"
+        #))
 
         
         self.apply_button = gui.Button("Apply new scales")
