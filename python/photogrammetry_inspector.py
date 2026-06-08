@@ -150,6 +150,74 @@ def colorize_point_cloud_by_z(pcd: o3d.geometry.PointCloud):
     return pcd
 
 
+def preview_cache_path(cache_dir: Path, image_path: Path):
+    return cache_dir / f"{image_path.stem}.jpg"
+    
+def run_make_preview_script(make_preview_script: Path, src_path: Path, cache_dir: Path,
+                            max_size=256, verbose=False):
+    cmd = [
+        sys.executable,
+        str(make_preview_script),
+        "--input", str(src_path),
+        "--output-dir", str(cache_dir),
+        "--max-size", str(max_size),
+        "--jpg",
+    ]
+
+    if verbose:
+        cmd.append("--verbose")
+
+    info(f"Exécution make_preview.py sur {src_path.name}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if verbose and result.stdout.strip():
+        print(result.stdout.strip())
+    if verbose and result.stderr.strip():
+        print(result.stderr.strip(), file=sys.stderr)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Échec de make_preview.py pour {src_path}\n"
+            f"stdout: {result.stdout.strip()}\n"
+            f"stderr: {result.stderr.strip()}"
+        )
+        
+        
+def ensure_preview(src_path: Path, cache_dir: Path, make_preview_script: Path,
+                   max_size=256, verbose=False):
+    if not src_path.exists():
+        warn(f"Image source introuvable pour preview: {src_path}")
+        return None
+
+    cached = preview_cache_path(cache_dir, src_path)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if cached.exists():
+        if verbose:
+            info(f"Preview déjà présent: {cached}")
+        return cached
+
+    try:
+        run_make_preview_script(
+            make_preview_script=make_preview_script,
+            src_path=src_path,
+            cache_dir=cache_dir,
+            max_size=max_size,
+            verbose=verbose,
+        )
+    except Exception as e:
+        warn(f"Impossible de générer preview pour {src_path}: {e}")
+        return None
+
+    if cached.exists():
+        if verbose:
+            info(f"Preview généré: {cached}")
+        return cached
+
+    warn(f"Preview non généré après appel make_preview.py: {cached}")
+    return None
+    
+
 def load_3dpoints(colmap_dir: Path):
     def _load_txt(path: Path):
         ids = []
@@ -603,19 +671,41 @@ def make_sphere(center, radius=1.0, color=(1.0, 1.0, 0.0)):
     return mesh
 
 
-def resolve_image_path(images_dir: Path, colmap_name: str, verbose=False):
+def resolve_image_path(images_dir: Path,
+                       colmap_name: str,
+                       preview_cache_dir: Path = None,
+                       make_preview_script: Path = None,
+                       preview_max_size: int = 256,
+                       verbose=False):
     direct = images_dir / colmap_name
+    stem = Path(colmap_name).stem
+
+    source_path = None
+
     dbg(f"Recherche image directe: {direct}", verbose)
     if direct.exists():
-        return direct
+        source_path = direct
+    else:
+        candidates = list(images_dir.glob(f"{stem}.*"))
+        dbg(f"Recherche par stem '{stem}': {len(candidates)} candidat(s)", verbose)
+        if candidates:
+            source_path = candidates[0]
 
-    stem = Path(colmap_name).stem
-    candidates = list(images_dir.glob(f"{stem}.*"))
-    dbg(f"Recherche par stem '{stem}': {len(candidates)} candidat(s)", verbose)
-    if candidates:
-        return candidates[0]
+    if source_path is None:
+        return None
 
-    return None
+    if preview_cache_dir is not None and make_preview_script is not None:
+        cached = ensure_preview(
+            src_path=source_path,
+            cache_dir=preview_cache_dir,
+            make_preview_script=make_preview_script,
+            max_size=preview_max_size,
+            verbose=verbose,
+        )
+        if cached is not None and cached.exists():
+            return cached
+
+    return source_path
 
 
 def draw_zoomed_projections_on_image(image_path: Path, uv_fullres, full_w, full_h,
@@ -699,10 +789,16 @@ class InspectorApp:
 
         self._camera_geom_names = []
         self._camera_image_geom_names = []
+        
+        self.preview_cache_dir = self.colmap_dir / "preview_cache"
+        self.make_preview_script = Path(__file__).resolve().parent / "make_preview.py"
+        self.preview_max_size = 256
 
         # -- Initialisation du frustum (échelle physique + bornes slider)
-        self.frustum_depth, self.frustum_basewidth, self.camera_scale_min, self.camera_scale_max = self._compute_camera_scale_defaults()
-
+        self.frustum_depth, self.frustum_basewidth = self._compute_camera_scale_defaults()
+        self.camera_scale_min = 0.25
+        self.camera_scale_max = 4.0
+        
         # Le slider contrôle un facteur multiplicatif appliqué à frustum_basewidth.
         if frustum_scale is None:
             frustum_scale = 1.0
@@ -804,12 +900,10 @@ class InspectorApp:
         self._on_recenter()
 
     def _compute_camera_scale_defaults(self):
-        import numpy as np
-
         centers = [build_T_wc_from_colmap_image(im)[:3, 3] for im in self.colmap_images.values()]
         if len(centers) < 2:
             print("[CAMSCALE] Trop peu de centres de caméras, fallback.")
-            return 1.0, 1.0, 0.2, 4.0
+            return 1.0, 1.0
 
         centers = np.asarray(centers, dtype=np.float64)
         scene_center = centers.mean(axis=0)
@@ -817,28 +911,15 @@ class InspectorApp:
         max_dist = np.max(dists)
         print(f"[CAMSCALE] scene_center={scene_center} max_dist={max_dist:.6f}")
 
-        # Frustum: fond de chambre à 10% du rayon max
         depth = 0.10 * max_dist
         angle_deg = 45.0
         half_angle_rad = np.deg2rad(angle_deg / 2.0)
         base_width = 2.0 * depth * np.tan(half_angle_rad)
 
-        # Valeurs sliders
-        min_scale = max(base_width * 0.2, 1e-6)
-        max_scale = base_width * 4.0
-
-        print(f"[CAMSCALE] FOND CHAMBRE : depth={depth:.6f}m (10% du rayon max scène)")
+        print(f"[CAMSCALE] FOND CHAMBRE : depth={depth:.6f}m")
         print(f"[CAMSCALE] angle sommet frustum={angle_deg:.2f}°, base_width={base_width:.6f}")
-        print(f"[CAMSCALE] min_scale={min_scale:.6f} max_scale={max_scale:.6f}")
 
-        dbg(
-            f"[CAMSCALE] centre={scene_center} max_dist={max_dist:.3f} "
-            f"depth={depth:.3f} (fond chambre) "
-            f"angle={angle_deg:.1f} base_w={base_width:.3f} min={min_scale:.3f} max={max_scale:.3f}",
-            self.verbose
-        )
-
-        return depth, base_width, min_scale, max_scale
+        return depth, base_width
 
     def _build_ui(self):
         self.left_panel.add_child(gui.Label("3D scene"))
@@ -888,6 +969,10 @@ class InspectorApp:
         self.frustum_slider.double_value = self.state["frustum_scale"]
         self.frustum_slider.set_on_value_changed(self._on_frustum_scale_changed)
         self.left_panel.add_child(self.frustum_slider)
+
+        self.left_panel.add_child(gui.Label(
+            f"Base={self.frustum_basewidth:.3f} | depth={self.frustum_depth:.3f} | factor=[{self.camera_scale_min:.2f}, {self.camera_scale_max:.2f}]"
+        ))
 
 
         self.left_panel.add_child(gui.Label(
@@ -1160,7 +1245,14 @@ class InspectorApp:
                 self.scene_widget.scene.add_geometry(name, frustum, mat_line)
                 self._camera_geom_names.append(name)
 
-                image_path = resolve_image_path(self.images_dir, im["name"], verbose=self.verbose)
+                image_path = resolve_image_path(
+                    self.images_dir,
+                    im["name"],
+                    preview_cache_dir=self.preview_cache_dir,
+                    make_preview_script=self.make_preview_script,
+                    preview_max_size=self.preview_max_size,
+                    verbose=self.verbose,
+                )
                 
                 if self.state["show_camera_images"]:
                   if image_path is not None:
