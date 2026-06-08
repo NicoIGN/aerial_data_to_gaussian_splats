@@ -5,6 +5,7 @@ import argparse
 import struct
 import sys
 from pathlib import Path
+import subprocess
 
 import numpy as np
 
@@ -149,6 +150,34 @@ def colorize_point_cloud_by_z(pcd: o3d.geometry.PointCloud):
     pcd.colors = o3d.utility.Vector3dVector(cols)
     return pcd
 
+def _setup_camera_with_bounds(self, bounds):
+    center = bounds.get_center()
+    extent = bounds.get_extent()
+    radius = 0.5 * float(np.linalg.norm(extent))
+
+    if radius < 1e-6:
+        radius = 1.0
+
+    eye = center + np.array([0.0, -2.5 * radius, 1.2 * radius], dtype=np.float64)
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    self.scene_widget.look_at(center, eye, up)
+
+    try:
+        fov_deg = 60.0
+        near = max(radius * 0.01, 0.001)
+        far = max(radius * 20.0, 10.0)
+
+        self.scene_widget.scene.camera.set_projection(
+            fov_deg,
+            self.scene_widget.frame.width / max(self.scene_widget.frame.height, 1),
+            near,
+            far,
+            rendering.Camera.FovType.Vertical
+        )
+    except Exception:
+        pass
+        
 
 def preview_cache_path(cache_dir: Path, image_path: Path):
     return cache_dir / f"{image_path.stem}.jpg"
@@ -1464,13 +1493,16 @@ class InspectorApp:
             target_dist = max(target_dist, 1e-3)
 
             new_eye = cam_pos + lateral_shift + (depth - target_dist) * view_dir
-            new_lookat = new_eye + view_dir
 
-            self.scene_widget.look_at(new_lookat, new_eye, cam_up)
+            # IMPORTANT : centre réel de rotation/orbite
+            orbit_center = bbox_center
+
+            self.scene_widget.look_at(orbit_center, new_eye, cam_up)
 
             try:
-                near = max(target_dist * 0.001, 0.001)
-                far = max(target_dist + 4.0 * bbox_radius, 10.0)
+                near = max(target_dist * 0.01, 0.01)
+                far = max(target_dist + 20.0 * bbox_radius, 50.0)
+
                 self.scene_widget.scene.camera.set_projection(
                     fov_deg,
                     self.scene_widget.frame.width / max(self.scene_widget.frame.height, 1),
