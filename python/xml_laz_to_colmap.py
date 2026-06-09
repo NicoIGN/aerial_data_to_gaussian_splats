@@ -3,7 +3,6 @@
 
 import argparse
 import json
-import shutil
 import struct
 import subprocess
 import sys
@@ -59,6 +58,7 @@ def parse_sensor_streaming(xml_path: Path):
             usefull_frame = elem.find("usefull-frame/rect")
             focal_pt = elem.find("focal/pt3d")
             pixel_size_txt = elem.findtext("pixel_size")
+            orientation_txt = elem.findtext("orientation")
 
             if usefull_frame is None or focal_pt is None or pixel_size_txt is None:
                 elem.clear()
@@ -66,26 +66,29 @@ def parse_sensor_streaming(xml_path: Path):
 
             width = int(float(usefull_frame.findtext("w")))
             height = int(float(usefull_frame.findtext("h")))
-            cx = float(focal_pt.findtext("x"))
-            cy = float(focal_pt.findtext("y"))
-            fx = float(focal_pt.findtext("z"))
-            fy = fx
+
+            # ATTENTION:
+            # Dans le C++, focal.pt3d.x/y sont cPPA/lPPA, pas forcément un cx/cy COLMAP direct.
+            cppa = float(focal_pt.findtext("x"))
+            lppa = float(focal_pt.findtext("y"))
+            focal_px = float(focal_pt.findtext("z"))
+
             pixel_size_m = float(pixel_size_txt)
-            focal_mm = fx * pixel_size_m * 1000.0
+            focal_mm = focal_px * pixel_size_m * 1000.0
 
             sensor_info = {
                 "width": width,
                 "height": height,
-                "cx": cx,
-                "cy": cy,
-                "fx": fx,
-                "fy": fy,
+                "cppa": cppa,
+                "lppa": lppa,
+                "fx": focal_px,
+                "fy": focal_px,
                 "pixel_size_m": pixel_size_m,
                 "focal_mm": focal_mm,
                 "sensor_name": elem.findtext("name"),
                 "serial_number": elem.findtext("serial-number"),
                 "objectif": elem.findtext("objectif"),
-                "orientation": elem.findtext("orientation"),
+                "orientation": int(orientation_txt) if orientation_txt is not None else 0,
             }
             elem.clear()
             break
@@ -150,31 +153,115 @@ def iter_cliches_streaming(xml_path: Path, image_index: dict, verbose: int = 1):
             elem.clear()
 
 
-def pose_xml_to_colmap(quat_xyzw, center_xyz, assume_camera_to_world=True, axis_conv=None):
+def pose_xml_to_colmap_cpp_exact(quat_xyzw, center_xyz):
+    """
+    Reproduit exactement la logique C++ montrée dans Shot::initialize() :
+
+        quat.getRotation(mat)
+
+        rotation[0][0] =  mat(0, 1)
+        rotation[0][1] =  mat(1, 1)
+        rotation[0][2] =  mat(2, 1)
+        rotation[1][0] =  mat(0, 0)
+        rotation[1][1] =  mat(1, 0)
+        rotation[1][2] =  mat(2, 0)
+        rotation[2][0] = -mat(0, 2)
+        rotation[2][1] = -mat(1, 2)
+        rotation[2][2] = -mat(2, 2)
+
+    Puis projection:
+        Xc = R_cw * (Xw - C)
+        t  = -R_cw * C
+    """
     rot = R.from_quat(quat_xyzw)
+    mat = rot.as_matrix()
 
-    if assume_camera_to_world:
-        rot_cw = rot.inv()
-    else:
-        rot_cw = rot
+    R_cw = np.array([
+        [ mat[0, 1],  mat[1, 1],  mat[2, 1]],
+        [ mat[0, 0],  mat[1, 0],  mat[2, 0]],
+        [-mat[0, 2], -mat[1, 2], -mat[2, 2]],
+    ], dtype=np.float64)
 
-    R_cw = rot_cw.as_matrix()
-
-    if axis_conv is not None:
-        R_cw = axis_conv @ R_cw
-
-    t = -R_cw @ center_xyz
-    
     det = np.linalg.det(R_cw)
     if det <= 0:
-        raise ValueError(
-            f"axis_conv produit une matrice non convertible en quaternion (det={det}). "
-            "Les flips miroirs purs comme flip_y ne peuvent pas être exportés comme pose COLMAP."
-        )
+        raise ValueError(f"Matrice rotation invalide pour COLMAP (det={det})")
+
+    t = -R_cw @ center_xyz
+
     rot_final = R.from_matrix(R_cw)
     qx, qy, qz, qw = rot_final.as_quat()
     qvec = np.array([qw, qx, qy, qz], dtype=np.float64)
+
     return qvec, t, R_cw
+
+
+def principal_point_from_ppa(width, height, cppa, lppa, ppa_mode):
+    """
+    Convertit cPPA/lPPA MATIS vers un principal point pixel supposé.
+
+    INCERTAIN : faute d'avoir le code exact de BundleToImage côté intrinseque,
+    on expose plusieurs hypothèses.
+    """
+    if ppa_mode == "direct":
+        # Hypothèse la plus naïve
+        cx = cppa
+        cy = lppa
+    elif ppa_mode == "center_plus":
+        # Hypothèse fréquente si PPA est exprimé autour du centre image
+        cx = (width / 2.0) + cppa
+        cy = (height / 2.0) + lppa
+    elif ppa_mode == "center_minus":
+        cx = (width / 2.0) - cppa
+        cy = (height / 2.0) - lppa
+    elif ppa_mode == "half_pixel_center_plus":
+        cx = ((width - 1) / 2.0) + cppa
+        cy = ((height - 1) / 2.0) + lppa
+    elif ppa_mode == "half_pixel_center_minus":
+        cx = ((width - 1) / 2.0) - cppa
+        cy = ((height - 1) / 2.0) - lppa
+    else:
+        raise ValueError(f"ppa_mode inconnu: {ppa_mode}")
+
+    return cx, cy
+
+
+def apply_sensor_orientation_to_intrinsics(width, height, fx, fy, cx, cy, orientation):
+    """
+    Applique une rotation capteur sur les intrinsics SI les images exportées
+    sont effectivement tournées dans le raster final.
+
+    orientation XML:
+      0 -> 0°
+      1 -> 180°
+      2 -> 90°
+      3 -> 270°
+    """
+    orientation = int(orientation)
+
+    if orientation == 0:
+        return width, height, fx, fy, cx, cy
+
+    if orientation == 1:  # 180°
+        return width, height, fx, fy, (width - 1 - cx), (height - 1 - cy)
+
+    if orientation == 2:  # 90°
+        return height, width, fy, fx, cy, (width - 1 - cx)
+
+    if orientation == 3:  # 270°
+        return height, width, fy, fx, (height - 1 - cy), cx
+
+    raise ValueError(f"Orientation capteur inconnue: {orientation}")
+
+
+def scale_intrinsics(width, height, fx, fy, cx, cy, factor):
+    factor = max(float(factor), 1.0)
+    width2 = max(1, int(round(width / factor)))
+    height2 = max(1, int(round(height / factor)))
+    fx2 = fx / factor
+    fy2 = fy / factor
+    cx2 = cx / factor
+    cy2 = cy / factor
+    return width2, height2, fx2, fy2, cx2, cy2
 
 
 def write_cameras_txt(path: Path, width: int, height: int, fx: float, fy: float, cx: float, cy: float):
@@ -185,39 +272,64 @@ def write_cameras_txt(path: Path, width: int, height: int, fx: float, fy: float,
         f.write(f"1 PINHOLE {width} {height} {fx:.12f} {fy:.12f} {cx:.12f} {cy:.12f}\n")
 
 
-def write_images_txt(path: Path, frames):
+def write_images_txt(path: Path, frames, observations_by_image):
     with open(path, "w", encoding="utf-8") as f:
         f.write("# Image list with two lines of data per image:\n")
         f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
         f.write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
         f.write(f"# Number of images: {len(frames)}\n")
+
         for fr in frames:
             q = fr["qvec"]
             t = fr["tvec"]
+            image_id = fr["image_id"]
+
             f.write(
-                f'{fr["image_id"]} '
+                f'{image_id} '
                 f'{q[0]:.12f} {q[1]:.12f} {q[2]:.12f} {q[3]:.12f} '
                 f'{t[0]:.12f} {t[1]:.12f} {t[2]:.12f} '
                 f'1 {fr["frame_name"]}\n'
             )
-            f.write("\n")
+
+            obs = observations_by_image.get(image_id, [])
+            line = []
+            for o in obs:
+                x, y = o["xy"]
+                pid = o["point3d_id"]
+                line.append(f"{x:.6f} {y:.6f} {pid}")
+
+            f.write(" ".join(line) + "\n")
 
 
-def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None):
+def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None, tracks_by_point=None):
     if pts_rgb is None:
         pts_rgb = np.full((len(pts_xyz), 3), 200, dtype=np.uint8)
+
+    if tracks_by_point is None:
+        tracks_by_point = [[] for _ in range(len(pts_xyz))]
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("# 3D point list with one line of data per point:\n")
         f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
         f.write(f"# Number of points: {len(pts_xyz)}\n")
-        for i, (p, c) in enumerate(zip(pts_xyz, pts_rgb), start=1):
-            f.write(
-                f"{i} "
-                f"{p[0]:.12f} {p[1]:.12f} {p[2]:.12f} "
-                f"{int(c[0])} {int(c[1])} {int(c[2])} "
-                f"0.0\n"
-            )
+
+        for i, (p, c, track) in enumerate(zip(pts_xyz, pts_rgb, tracks_by_point), start=1):
+            parts = [
+                str(i),
+                f"{p[0]:.12f}",
+                f"{p[1]:.12f}",
+                f"{p[2]:.12f}",
+                str(int(c[0])),
+                str(int(c[1])),
+                str(int(c[2])),
+                "0.0",
+            ]
+
+            for tr in track:
+                parts.append(str(tr["image_id"]))
+                parts.append(str(tr["point2d_idx"]))
+
+            f.write(" ".join(parts) + "\n")
 
 
 def read_laz_points(laz_path: Path, stride: int):
@@ -240,6 +352,70 @@ def read_laz_points(laz_path: Path, stride: int):
         rgb = rgb[::stride]
 
     return xyz, rgb
+
+
+def project_point(R_cw, t_cw, fx, fy, cx, cy, xyz):
+    Xc = R_cw @ xyz + t_cw
+    z = float(Xc[2])
+
+    if z <= 1e-9:
+        return None
+
+    u = fx * (Xc[0] / z) + cx
+    v = fy * (Xc[1] / z) + cy
+    return np.array([u, v], dtype=np.float64), z
+
+
+def build_synthetic_observations(frames, pts_xyz, width, height, fx, fy, cx, cy,
+                                 max_points_per_image=None, verbose=1):
+    observations_by_image = {fr["image_id"]: [] for fr in frames}
+    tracks_by_point = [[] for _ in range(len(pts_xyz))]
+
+    for fr in frames:
+        image_id = fr["image_id"]
+        R_cw = fr["R_cw"]
+        t_cw = fr["tvec"]
+
+        candidates = []
+
+        for pid, xyz in enumerate(pts_xyz, start=1):
+            proj = project_point(R_cw, t_cw, fx, fy, cx, cy, xyz)
+            if proj is None:
+                continue
+
+            uv, depth = proj
+            u, v = uv
+
+            if not (0.0 <= u < width and 0.0 <= v < height):
+                continue
+
+            candidates.append({
+                "xy": uv,
+                "depth": depth,
+                "point3d_id": pid,
+            })
+
+        candidates.sort(key=lambda o: o["depth"])
+
+        if max_points_per_image is not None:
+            candidates = candidates[:max_points_per_image]
+
+        for obs in candidates:
+            point2d_idx = len(observations_by_image[image_id])
+
+            observations_by_image[image_id].append({
+                "xy": obs["xy"],
+                "point3d_id": obs["point3d_id"],
+            })
+
+            tracks_by_point[obs["point3d_id"] - 1].append({
+                "image_id": image_id,
+                "point2d_idx": point2d_idx,
+            })
+
+        log(f"  Image {image_id}: {len(candidates)} observations synthétiques", 1, verbose)
+
+    return observations_by_image, tracks_by_point
 
 
 def build_transforms_json(path: Path, frames, width, height, fx, fy, cx, cy):
@@ -287,41 +463,6 @@ def try_write_colmap_bin(sparse_dir: Path, verbose: int):
         return False
 
 
-def axis_convention_matrix(name: str):
-    if name == "identity":
-        return np.eye(3, dtype=np.float64)
-    if name == "flip_yz":
-        return np.diag([1.0, -1.0, -1.0]).astype(np.float64)
-    if name == "flip_y":
-        return np.diag([1.0, -1.0, 1.0]).astype(np.float64)
-    if name == "flip_z":
-        return np.diag([1.0, 1.0, -1.0]).astype(np.float64)
-    if name == "rot_cw_90":
-        return np.array([
-            [0.0, 1.0, 0.0],
-            [-1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ], dtype=np.float64)
-    if name == "rot_ccw_90":
-        return np.array([
-            [0.0, -1.0, 0.0],
-            [1.0,  0.0, 0.0],
-            [0.0,  0.0, 1.0],
-        ], dtype=np.float64)
-    raise ValueError(f"Convention d'axes inconnue: {name}")
-
-
-def parse_axis_convention(spec: str):
-    names = [s.strip() for s in spec.split(",") if s.strip()]
-    if not names:
-        return np.eye(3, dtype=np.float64)
-
-    M = np.eye(3, dtype=np.float64)
-    for name in names:
-        M = axis_convention_matrix(name) @ M
-    return M
-
-
 def run_decompression_script(script_path: Path, input_dir: Path, output_dir: Path,
                              factor: float, jpeg_quality: int, verbose: int):
     cmd = [
@@ -351,14 +492,27 @@ def main():
     ap.add_argument("--image-factor", type=float, default=1.0,
                     help="Facteur de sous-échantillonnage des images (2 = largeur/hauteur divisées par 2)")
     ap.add_argument("--jpeg-quality", type=int, default=95, help="Qualité JPEG de sortie")
-    ap.add_argument("--assume-camera-to-world", action="store_true",
-                    help="Interprète le quaternion XML comme caméra->monde")
+    ap.add_argument("--max-observations-per-image", type=int, default=5000,
+                    help="Nombre max d'observations synthétiques par image")
+    # Hypothèses encore incertaines
     ap.add_argument(
-                    "--axis-convention",
-                    default="identity",
-                    help="Transformations fixes du repère caméra, séparées par des virgules: "
-                         "identity, flip_yz, flip_y, flip_z, rot_cw_90, rot_ccw_90"
-                )
+        "--ppa-mode",
+        default="center_plus",
+        choices=[
+            "direct",
+            "center_plus",
+            "center_minus",
+            "half_pixel_center_plus",
+            "half_pixel_center_minus",
+        ],
+        help="Interprétation de cPPA/lPPA en principal point pixel"
+    )
+    ap.add_argument(
+        "--apply-sensor-orientation-to-intrinsics",
+        action="store_true",
+        help="Applique la rotation capteur XML aux intrinsics exportées"
+    )
+
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                     help="0=silencieux, 1=info, 2=warn+info")
     args = ap.parse_args()
@@ -397,25 +551,48 @@ def main():
     height0 = sensor["height"]
     fx0 = sensor["fx"]
     fy0 = sensor["fy"]
-    cx0 = sensor["cx"]
-    cy0 = sensor["cy"]
+    cppa0 = sensor["cppa"]
+    lppa0 = sensor["lppa"]
+    orientation0 = int(sensor.get("orientation", 0))
+
+    cx0, cy0 = principal_point_from_ppa(
+        width=width0,
+        height=height0,
+        cppa=cppa0,
+        lppa=lppa0,
+        ppa_mode=args.ppa_mode,
+    )
+
+    width1, height1, fx1, fy1, cx1, cy1 = width0, height0, fx0, fy0, cx0, cy0
+    if args.apply_sensor_orientation_to_intrinsics:
+        width1, height1, fx1, fy1, cx1, cy1 = apply_sensor_orientation_to_intrinsics(
+            width=width0,
+            height=height0,
+            fx=fx0,
+            fy=fy0,
+            cx=cx0,
+            cy=cy0,
+            orientation=orientation0,
+        )
 
     factor = max(float(args.image_factor), 1.0)
-
-    width = max(1, int(width0 / factor))
-    height = max(1, int(height0 / factor))
-    fx = fx0 / factor
-    fy = fy0 / factor
-    cx = cx0 / factor
-    cy = cy0 / factor
+    width, height, fx, fy, cx, cy = scale_intrinsics(
+        width1, height1, fx1, fy1, cx1, cy1, factor
+    )
 
     log(f"  Capteur: {sensor.get('sensor_name')}", 1, args.verbose)
-    log(f"  Orientation capteur XML: {sensor.get('orientation')}", 1, args.verbose)
+    log(f"  Orientation capteur XML: {orientation0}", 1, args.verbose)
     log(f"  Taille native: {width0}x{height0}", 1, args.verbose)
-    log(f"  Taille exportée: {width}x{height}", 1, args.verbose)
     log(f"  Focale px native: ({fx0:.3f}, {fy0:.3f})", 1, args.verbose)
+    log(f"  cPPA/lPPA natifs: ({cppa0:.3f}, {lppa0:.3f})", 1, args.verbose)
+    log(f"  Principal point avant orientation: ({cx0:.3f}, {cy0:.3f})", 1, args.verbose)
+    log(f"  Principal point après orientation: ({cx1:.3f}, {cy1:.3f})", 1, args.verbose)
+    log(f"  Taille avant scale: {width1}x{height1}", 1, args.verbose)
+    log(f"  Taille exportée: {width}x{height}", 1, args.verbose)
     log(f"  Focale px exportée: ({fx:.3f}, {fy:.3f})", 1, args.verbose)
-    log(f"  Point principal exporté: ({cx:.3f}, {cy:.3f})", 1, args.verbose)
+    log(f"  Principal point exporté: ({cx:.3f}, {cy:.3f})", 1, args.verbose)
+    log(f"  ppa_mode: {args.ppa_mode}", 1, args.verbose)
+    log(f"  apply_sensor_orientation_to_intrinsics: {args.apply_sensor_orientation_to_intrinsics}", 1, args.verbose)
 
     log("[3/9] Décompression + sous-échantillonnage des images...", 1, args.verbose)
     run_decompression_script(
@@ -429,8 +606,6 @@ def main():
 
     decompressed_index = build_image_index(out_images)
     log(f"  {len(decompressed_index)} images exportées indexées.", 1, args.verbose)
-
-    axis_conv = parse_axis_convention(args.axis_convention)
 
     log("[4/9] Lecture streaming des clichés valides...", 1, args.verbose)
     frames = []
@@ -447,11 +622,9 @@ def main():
 
         frame_name = exported_img.name
 
-        qvec, tvec, R_cw = pose_xml_to_colmap(
+        qvec, tvec, R_cw = pose_xml_to_colmap_cpp_exact(
             item["quat_xyzw"],
             item["center"],
-            assume_camera_to_world=args.assume_camera_to_world,
-            axis_conv=axis_conv
         )
 
         frames.append({
@@ -478,17 +651,31 @@ def main():
     pts_xyz, pts_rgb = read_laz_points(laz_path, args.subsample)
     log(f"  {len(pts_xyz)} points conservés.", 1, args.verbose)
 
+    log("[6/9] Génération des observations synthétiques...", 1, args.verbose)
+    observations_by_image, tracks_by_point = build_synthetic_observations(
+        frames=frames,
+        pts_xyz=pts_xyz,
+        width=width,
+        height=height,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        max_points_per_image=args.max_observations_per_image,
+        verbose=args.verbose,
+    )
+
     log("[6/9] Écriture cameras.txt...", 1, args.verbose)
     write_cameras_txt(out_sparse / "cameras.txt", width, height, fx, fy, cx, cy)
 
     log("[7/9] Écriture images.txt et points3D.txt...", 1, args.verbose)
-    write_images_txt(out_sparse / "images.txt", frames)
-    write_points3D_txt(out_sparse / "points3D.txt", pts_xyz, pts_rgb)
+    write_images_txt(out_sparse / "images.txt", frames, observations_by_image)
+    write_points3D_txt(out_sparse / "points3D.txt", pts_xyz, pts_rgb, tracks_by_point)
 
     log("[8/9] Export transforms.json...", 1, args.verbose)
     build_transforms_json(out_colmap / "transforms.json", frames, width, height, fx, fy, cx, cy)
 
-    log("[9/9] Conversion binaire optionnelle...", 1, args.verbose)
+    log("Conversion au format binaire...", 1, args.verbose)
     try_write_colmap_bin(out_sparse, args.verbose)
 
     print("\nTerminé.")

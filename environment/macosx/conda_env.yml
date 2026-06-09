@@ -1,0 +1,55 @@
+name: gsplat
+
+channels:
+  - pytorch
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+  - bash>=4
+  - wget
+
+  # Utilities
+  - rclone
+  - tree
+  - tqdm
+  - ultralytics
+  - matplotlib
+
+  # Build tools
+  - cmake
+  - ninja
+
+  # Scientific stack
+  - "numpy<2"
+  - scipy
+
+  # IO / Media
+  - openimageio
+  - ffmpeg
+  - imageio
+  - imageio-ffmpeg
+  - rasterio
+  - libgdal-jp2openjpeg
+  
+  # Geometry / SfM
+  - colmap=3.8
+  - pycolmap
+  - faiss-cpu
+  - plyfile
+  - laspy
+  - pdal
+
+  # Graphics
+  - glew
+  - qt-main
+
+  - pip:
+      - nerfstudio==1.1.5
+      - gsplat==1.4.0
+      # - pycolmap==3.12.5
+      - fpsample
+      - git+https://github.com/cvg/Hierarchical-Localization.git@v1.4
+      - git+https://github.com/facebookresearch/segment-anything.git
+      - plyfile
