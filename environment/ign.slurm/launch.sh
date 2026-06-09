@@ -8,7 +8,7 @@ VERBOSE="${VERBOSE:-false}"
 
 : "${GIT_ROOT:?❌ GIT_ROOT is not set. Example: GIT_ROOT=/path/to/video_to_ply ./submit.sh}"
 
-LAUNCH_SLURM="$GIT_ROOT/environment/ign.slurm/launch_slurm.sh"
+LAUNCH_SLURM="$GIT_ROOT/environment/ign.slurm/launch.slurm"
 RUN_SH="$GIT_ROOT/run.sh"
 CONFIG_SH="./config.sh"
 
