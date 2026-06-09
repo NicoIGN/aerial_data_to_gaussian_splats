@@ -61,16 +61,17 @@ def build_T_wc_from_colmap_image(colmap_image):
     T_wc[:3, 3] = C
     return T_wc
 
+
 def create_camera_frustum(T_wc, depth, base_width, aspect=1.0, color=(1.0, 0.0, 0.0)):
     half_w = base_width / 2.0
     half_h = half_w / max(aspect, 1e-12)
 
     pts_cam = np.array([
-        [0.0, 0.0, 0.0],           # sommet optique (caméra)
-        [-half_w, -half_h, depth], # base coin 1
-        [ half_w, -half_h, depth], # base coin 2
-        [ half_w,  half_h, depth], # base coin 3
-        [-half_w,  half_h, depth], # base coin 4
+        [0.0, 0.0, 0.0],
+        [-half_w, -half_h, depth],
+        [ half_w, -half_h, depth],
+        [ half_w,  half_h, depth],
+        [-half_w,  half_h, depth],
     ], dtype=np.float64)
 
     R_wc = T_wc[:3, :3]
@@ -83,12 +84,12 @@ def create_camera_frustum(T_wc, depth, base_width, aspect=1.0, color=(1.0, 0.0, 
     ]
     colors = np.tile(np.array(color, dtype=np.float64), (len(lines), 1))
 
-    import open3d as o3d
     frustum = o3d.geometry.LineSet()
     frustum.points = o3d.utility.Vector3dVector(pts_world)
     frustum.lines = o3d.utility.Vector2iVector(lines)
     frustum.colors = o3d.utility.Vector3dVector(colors)
     return frustum
+
 
 def create_textured_image_quad(T_wc, depth, base_width, aspect=1.0):
     half_w = base_width / 2.0
@@ -150,6 +151,7 @@ def colorize_point_cloud_by_z(pcd: o3d.geometry.PointCloud):
     pcd.colors = o3d.utility.Vector3dVector(cols)
     return pcd
 
+
 def _setup_camera_with_bounds(self, bounds):
     center = bounds.get_center()
     extent = bounds.get_extent()
@@ -177,11 +179,12 @@ def _setup_camera_with_bounds(self, bounds):
         )
     except Exception:
         pass
-        
+
 
 def preview_cache_path(cache_dir: Path, image_path: Path):
     return cache_dir / f"{image_path.stem}.jpg"
-    
+
+
 def run_make_preview_script(make_preview_script: Path, src_path: Path, cache_dir: Path,
                             max_size=256, verbose=False):
     cmd = [
@@ -210,8 +213,8 @@ def run_make_preview_script(make_preview_script: Path, src_path: Path, cache_dir
             f"stdout: {result.stdout.strip()}\n"
             f"stderr: {result.stderr.strip()}"
         )
-        
-        
+
+
 def ensure_preview(src_path: Path, cache_dir: Path, make_preview_script: Path,
                    max_size=256, verbose=False):
     if not src_path.exists():
@@ -245,7 +248,7 @@ def ensure_preview(src_path: Path, cache_dir: Path, make_preview_script: Path,
 
     warn(f"Preview non généré après appel make_preview.py: {cached}")
     return None
-    
+
 
 def load_3dpoints(colmap_dir: Path):
     def _load_txt(path: Path):
@@ -276,14 +279,12 @@ def load_3dpoints(colmap_dir: Path):
                 points.append([x, y, z])
                 colors.append([r / 255.0, g / 255.0, b / 255.0])
 
-                # Track COLMAP : IMAGE_ID POINT2D_IDX IMAGE_ID POINT2D_IDX ...
                 image_ids = []
                 track_parts = parts[8:]
 
                 for i in range(0, len(track_parts), 2):
                     if i + 1 >= len(track_parts):
                         break
-
                     image_id = int(track_parts[i])
                     image_ids.append(image_id)
 
@@ -403,7 +404,6 @@ def load_3dpoints(colmap_dir: Path):
     raise FileNotFoundError(
         "Impossible de trouver points3D.bin ou points3D.txt"
     )
-
 
 
 def load_colmap_images(colmap_dir: Path):
@@ -802,9 +802,37 @@ class InspectorApp:
         self.raw_pointcloud = o3d.geometry.PointCloud(pointcloud_data["pcd"])
         self.points_xyz = pointcloud_data["xyz"]
         self.point_ids = pointcloud_data["point_ids"]
-
-        # NEW: mapping point3D_id -> [image_id, ...]
         self.point_observations = pointcloud_data.get("observations", {})
+
+        self.point_id_to_global_index = {
+            int(pid): idx for idx, pid in enumerate(self.point_ids)
+        }
+
+        tracked_ids = {
+            int(pid)
+            for pid, obs in self.point_observations.items()
+            if obs is not None and len(obs.get("image_ids", [])) > 0
+        }
+
+        self.tracked_mask = np.array(
+            [int(pid) in tracked_ids for pid in self.point_ids],
+            dtype=bool
+        )
+
+        self.tracked_points_xyz = self.points_xyz[self.tracked_mask]
+        self.tracked_point_ids = self.point_ids[self.tracked_mask]
+
+        if self.raw_pointcloud.has_colors() and len(self.raw_pointcloud.points) == len(self.points_xyz):
+            raw_colors = np.asarray(self.raw_pointcloud.colors)
+            self.raw_point_colors = raw_colors
+            self.tracked_point_colors = raw_colors[self.tracked_mask]
+        else:
+            self.raw_point_colors = None
+            self.tracked_point_colors = None
+
+        info(
+            f"Points trackés: {int(np.count_nonzero(self.tracked_mask))} / {len(self.point_ids)}"
+        )
 
         self.colmap_images = colmap_images
         self.colmap_cameras = colmap_cameras
@@ -818,17 +846,15 @@ class InspectorApp:
 
         self._camera_geom_names = []
         self._camera_image_geom_names = []
-        
+
         self.preview_cache_dir = self.colmap_dir / "preview_cache"
         self.make_preview_script = Path(__file__).resolve().parent / "make_preview.py"
         self.preview_max_size = 256
 
-        # -- Initialisation du frustum (échelle physique + bornes slider)
         self.frustum_depth, self.frustum_basewidth = self._compute_camera_scale_defaults()
         self.camera_scale_min = 0.25
         self.camera_scale_max = 4.0
-        
-        # Le slider contrôle un facteur multiplicatif appliqué à frustum_basewidth.
+
         if frustum_scale is None:
             frustum_scale = 1.0
 
@@ -907,11 +933,12 @@ class InspectorApp:
 
         self.state = {
             "point_size": float(point_size),
-            "frustum_scale": float(frustum_scale),  # Multiplicatif sur la largeur du frustum
+            "frustum_scale": float(frustum_scale),
             "show_pointcloud": True,
             "show_cameras": True,
             "show_camera_images": True,
             "only_colmap_observations": True,
+            "show_only_tracked_points": False,
             "point_size_pending": float(point_size),
             "frustum_scale_pending": float(frustum_scale),
         }
@@ -927,6 +954,11 @@ class InspectorApp:
         self._install_interaction_handlers()
         self._refresh_image_list_for_selection()
         self._on_recenter()
+
+    def _get_displayed_points_and_ids(self):
+        if self.state.get("show_only_tracked_points", False):
+            return self.tracked_points_xyz, self.tracked_point_ids
+        return self.points_xyz, self.point_ids
 
     def _compute_camera_scale_defaults(self):
         centers = [build_T_wc_from_colmap_image(im)[:3, 3] for im in self.colmap_images.values()]
@@ -962,28 +994,21 @@ class InspectorApp:
         self.camera_checkbox.checked = True
         self.camera_checkbox.set_on_checked(self._on_toggle_cameras)
         self.left_panel.add_child(self.camera_checkbox)
-        
-        self.camera_images_checkbox = gui.Checkbox(
-            "Display images"
-        )
+
+        self.camera_images_checkbox = gui.Checkbox("Display images")
         self.camera_images_checkbox.checked = True
-        self.camera_images_checkbox.set_on_checked(
-            self._on_toggle_camera_images
-        )
-        self.left_panel.add_child(
-            self.camera_images_checkbox
-        )
-        
-        self.colmap_obs_checkbox = gui.Checkbox(
-            "COLMAP observations only"
-        )
+        self.camera_images_checkbox.set_on_checked(self._on_toggle_camera_images)
+        self.left_panel.add_child(self.camera_images_checkbox)
+
+        self.colmap_obs_checkbox = gui.Checkbox("COLMAP observations only")
         self.colmap_obs_checkbox.checked = True
-        self.colmap_obs_checkbox.set_on_checked(
-            self._on_toggle_colmap_observations
-        )
-        self.left_panel.add_child(
-            self.colmap_obs_checkbox
-        )
+        self.colmap_obs_checkbox.set_on_checked(self._on_toggle_colmap_observations)
+        self.left_panel.add_child(self.colmap_obs_checkbox)
+
+        self.tracked_points_checkbox = gui.Checkbox("Display only tracked 3D points")
+        self.tracked_points_checkbox.checked = False
+        self.tracked_points_checkbox.set_on_checked(self._on_toggle_tracked_points)
+        self.left_panel.add_child(self.tracked_points_checkbox)
 
         self.left_panel.add_child(gui.Label("3D points size"))
         self.pointsize_slider = gui.Slider(gui.Slider.DOUBLE)
@@ -1003,26 +1028,19 @@ class InspectorApp:
             f"Base={self.frustum_basewidth:.3f} | depth={self.frustum_depth:.3f} | factor=[{self.camera_scale_min:.2f}, {self.camera_scale_max:.2f}]"
         ))
 
-
-        #self.left_panel.add_child(gui.Label(
-        #    f"Default={self.frustum_basewidth:.3f} | min={self.camera_scale_min:.3f} | max={self.camera_scale_max:.3f}"
-        #))
-
-        
         self.apply_button = gui.Button("Apply new scales")
         self.apply_button.set_on_clicked(self._on_apply_settings)
         self.left_panel.add_child(self.apply_button)
-        
+
         self.recenter_button = gui.Button("Recenter view")
         self.recenter_button.set_on_clicked(self._on_recenter)
         self.left_panel.add_child(self.recenter_button)
-        
+
         self.left_panel.add_child(gui.Label("Selection"))
         self.left_panel.add_child(gui.Label("Clic: nearest visible point (buffer Z)"))
 
         self.selection_label = gui.Label("No selected point")
         self.left_panel.add_child(self.selection_label)
-
 
         self.window.add_child(self.left_panel)
         self.window.add_child(self.scene_widget)
@@ -1135,11 +1153,13 @@ class InspectorApp:
     def _select_nearest_point_from_click(self, x, y):
         dbg(f"Clic dans la vue 3D: x={x}, y={y}", self.verbose)
 
-        if len(self.points_xyz) == 0:
-            warn("Aucun point 3D chargé.")
+        displayed_xyz, displayed_ids = self._get_displayed_points_and_ids()
+
+        if len(displayed_xyz) == 0:
+            warn("Aucun point 3D affiché.")
             return
 
-        proj = self._project_points_to_screen(self.points_xyz)
+        proj = self._project_points_to_screen(displayed_xyz)
         screen_xy = proj["screen_xy"]
         depth = proj["depth"]
         valid = proj["valid"]
@@ -1188,16 +1208,23 @@ class InspectorApp:
                     self.verbose,
                 )
 
-            idx_global = int(valid_indices[best_local])
+            idx_displayed = int(valid_indices[best_local])
         else:
             idx_local = int(np.argmin(d2))
-            idx_global = int(valid_indices[idx_local])
+            idx_displayed = int(valid_indices[idx_local])
 
             dbg(
-                f"Fallback 2D global: idx={idx_global}, "
+                f"Fallback 2D global: idx={idx_displayed}, "
                 f"d2={d2[idx_local]:.3f}, depth_pt={ptsz[idx_local]:.6f}",
                 self.verbose,
             )
+
+        selected_pid = int(displayed_ids[idx_displayed])
+
+        idx_global = self.point_id_to_global_index.get(selected_pid)
+        if idx_global is None:
+            warn(f"Impossible de retrouver l'index global pour point_id={selected_pid}")
+            return
 
         self._set_selected_point(idx_global)
 
@@ -1212,7 +1239,21 @@ class InspectorApp:
         self.scene_widget.set_on_mouse(_on_mouse)
 
     def _build_colored_pointcloud(self):
-        pcd = o3d.geometry.PointCloud(self.raw_pointcloud)
+        points_xyz, _ = self._get_displayed_points_and_ids()
+
+        pcd = o3d.geometry.PointCloud()
+        if len(points_xyz) == 0:
+            return pcd
+
+        pcd.points = o3d.utility.Vector3dVector(points_xyz)
+
+        if self.state.get("show_only_tracked_points", False):
+            if self.tracked_point_colors is not None and len(self.tracked_point_colors) == len(points_xyz):
+                pcd.colors = o3d.utility.Vector3dVector(self.tracked_point_colors)
+        else:
+            if self.raw_point_colors is not None and len(self.raw_point_colors) == len(points_xyz):
+                pcd.colors = o3d.utility.Vector3dVector(self.raw_point_colors)
+
         return colorize_point_cloud_by_z(pcd)
 
     def _populate_scene(self):
@@ -1248,7 +1289,6 @@ class InspectorApp:
             self.scene_widget.scene.add_geometry("pointcloud", pcd, mat)
 
         if self.state["show_cameras"]:
-            # Nouveau : on n'utilise plus _estimate_camera_scale() du tout
             current_base_width = self.frustum_basewidth * self.state["frustum_scale"]
             current_depth = self.frustum_depth * self.state["frustum_scale"]
 
@@ -1282,40 +1322,41 @@ class InspectorApp:
                     preview_max_size=self.preview_max_size,
                     verbose=self.verbose,
                 )
-                
+
                 if self.state["show_camera_images"]:
-                  if image_path is not None:
-                      try:
-                          with Image.open(image_path) as img:
-                              w, h = img.size
-                          if h > 0 and w > 0:
-                              aspect = w / h
+                    if image_path is not None:
+                        try:
+                            with Image.open(image_path) as img:
+                                w, h = img.size
+                            if h > 0 and w > 0:
+                                aspect = w / h
 
-                          quad = create_textured_image_quad(
-                              T_wc,
-                              depth=current_depth,
-                              base_width=current_base_width,
-                              aspect=aspect,
-                          )
+                            quad = create_textured_image_quad(
+                                T_wc,
+                                depth=current_depth,
+                                base_width=current_base_width,
+                                aspect=aspect,
+                            )
 
-                          material = rendering.MaterialRecord()
-                          material.shader = "defaultUnlit"
-                          material.base_color = [1.0, 1.0, 1.0, 1.0]
-                          material.albedo_img = o3d.io.read_image(str(image_path))
+                            material = rendering.MaterialRecord()
+                            material.shader = "defaultUnlit"
+                            material.base_color = [1.0, 1.0, 1.0, 1.0]
+                            material.albedo_img = o3d.io.read_image(str(image_path))
 
-                          img_name = f"cam_img_{image_id}"
-                          self.scene_widget.scene.add_geometry(img_name, quad, material)
-                          self._camera_image_geom_names.append(img_name)
-                      except Exception as e:
-                          dbg(f"Impossible d'ajouter la preview caméra {im['name']}: {e}", self.verbose)
+                            img_name = f"cam_img_{image_id}"
+                            self.scene_widget.scene.add_geometry(img_name, quad, material)
+                            self._camera_image_geom_names.append(img_name)
+                        except Exception as e:
+                            dbg(f"Impossible d'ajouter la preview caméra {im['name']}: {e}", self.verbose)
 
         self._update_selection_geometry()
 
     def _compute_scene_bounds(self):
         arrays = []
 
-        if len(self.points_xyz) > 0:
-            arrays.append(self.points_xyz)
+        displayed_xyz, _ = self._get_displayed_points_and_ids()
+        if len(displayed_xyz) > 0:
+            arrays.append(displayed_xyz)
 
         centers = []
         for im in self.colmap_images.values():
@@ -1336,7 +1377,7 @@ class InspectorApp:
         pad = np.maximum((pmax - pmin) * 0.05, 1e-3)
 
         return o3d.geometry.AxisAlignedBoundingBox(pmin - pad, pmax + pad)
-        
+
     def _estimate_camera_scale(self):
         if len(self.colmap_images) < 2:
             return 1.0
@@ -1391,14 +1432,15 @@ class InspectorApp:
             return
 
         scene_extent = 1.0
-        if len(self.points_xyz) > 0:
-            pmin = self.points_xyz.min(axis=0)
-            pmax = self.points_xyz.max(axis=0)
+        displayed_xyz, _ = self._get_displayed_points_and_ids()
+        if len(displayed_xyz) > 0:
+            pmin = displayed_xyz.min(axis=0)
+            pmax = displayed_xyz.max(axis=0)
             scene_extent = max(float(np.max(pmax - pmin)), 1e-6)
 
         radius = max(scene_extent * 0.0001, 1e-5)
         sphere = make_sphere(self.selected_point_xyz, radius=radius, color=(1.0, 1.0, 0.0))
-        
+
         mat = rendering.MaterialRecord()
         mat.shader = "defaultLit"
         self.scene_widget.scene.add_geometry(self.selected_sphere_name, sphere, mat)
@@ -1410,21 +1452,25 @@ class InspectorApp:
     def _on_toggle_cameras(self, checked):
         self.state["show_cameras"] = bool(checked)
         self._populate_scene()
-        
+
     def _on_toggle_camera_images(self, checked):
         self.state["show_camera_images"] = bool(checked)
         self._populate_scene()
-        
+
     def _on_toggle_colmap_observations(self, checked):
         self.state["only_colmap_observations"] = bool(checked)
         self._refresh_image_list_for_selection()
+
+    def _on_toggle_tracked_points(self, checked):
+        self.state["show_only_tracked_points"] = bool(checked)
+        self._populate_scene()
 
     def _on_point_size_changed(self, value):
         self.state["point_size_pending"] = float(value)
 
     def _on_frustum_scale_changed(self, value):
         self.state["frustum_scale_pending"] = float(value)
-        
+
     def _on_apply_settings(self):
         self.state["point_size"] = self.state["point_size_pending"]
         self.state["frustum_scale"] = self.state["frustum_scale_pending"]
@@ -1493,8 +1539,6 @@ class InspectorApp:
             target_dist = max(target_dist, 1e-3)
 
             new_eye = cam_pos + lateral_shift + (depth - target_dist) * view_dir
-
-            # IMPORTANT : centre réel de rotation/orbite
             orbit_center = bbox_center
 
             self.scene_widget.look_at(orbit_center, new_eye, cam_up)
@@ -1585,9 +1629,7 @@ class InspectorApp:
         point_id = int(self.point_ids[self.selected_point_index])
 
         if self.state["only_colmap_observations"]:
-
             obs = self.point_observations.get(point_id)
-
             candidate_image_ids = (
                 obs.get("image_ids", [])
                 if obs is not None
@@ -1599,12 +1641,8 @@ class InspectorApp:
                 f"point_id={point_id} "
                 f"({len(candidate_image_ids)} image(s))"
             )
-
         else:
-
-            candidate_image_ids = list(
-                self.colmap_images.keys()
-            )
+            candidate_image_ids = list(self.colmap_images.keys())
 
             info(
                 f"Mode toutes les images : "
@@ -1627,10 +1665,7 @@ class InspectorApp:
             return
 
         for image_id in candidate_image_ids:
-
-            colmap_image = self.colmap_images.get(
-                image_id
-            )
+            colmap_image = self.colmap_images.get(image_id)
 
             if colmap_image is None:
                 warn(
@@ -1639,9 +1674,7 @@ class InspectorApp:
                 )
                 continue
 
-            cam = self.colmap_cameras.get(
-                colmap_image["camera_id"]
-            )
+            cam = self.colmap_cameras.get(colmap_image["camera_id"])
 
             if cam is None:
                 warn(
@@ -1692,14 +1725,9 @@ class InspectorApp:
                 proj = None
 
             if proj is None:
-                dbg(
-                    "projection=None",
-                    self.verbose,
-                )
+                dbg("projection=None", self.verbose)
                 continue
 
-            # sécurité: normalement inutile car
-            # le point vient du track COLMAP
             if not proj["inside"]:
                 dbg(
                     f"Hors image "
@@ -1727,14 +1755,9 @@ class InspectorApp:
                 "height": int(cam["height"]),
             })
 
-            info(
-                f"Image retenue: "
-                f"{image_name}"
-            )
+            info(f"Image retenue: {image_name}")
 
-        projections_per_image.sort(
-            key=lambda x: x["depth"]
-        )
+        projections_per_image.sort(key=lambda x: x["depth"])
 
         info(
             f"Nombre total d'images "
@@ -1761,15 +1784,9 @@ class InspectorApp:
             f"image(s) correspondante(s)"
         )
 
-        self.right_items_layout.add_child(
-            header
-        )
-        self.right_items_layout.add_child(
-            gui.Label("")
-        )
-        self.right_items_layout.add_child(
-            gui.Label("")
-        )
+        self.right_items_layout.add_child(header)
+        self.right_items_layout.add_child(gui.Label(""))
+        self.right_items_layout.add_child(gui.Label(""))
 
         cards = [
             self._make_image_card(item)
@@ -1787,6 +1804,7 @@ class InspectorApp:
 
     def run(self):
         self.app.run()
+
 
 def main():
     ap = argparse.ArgumentParser(description="Interface 3D/2D d'inspection photogrammétrique")

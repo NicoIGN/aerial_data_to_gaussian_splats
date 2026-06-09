@@ -283,26 +283,53 @@ def project_point(R_cw, t_cw, fx, fy, cx, cy, xyz, transfo2d=None):
     return np.array([u, v], dtype=np.float64), z
 
 
-def build_synthetic_observations(frames, pts_xyz, max_points_per_image=None, verbose=1):
+def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_points=None, verbose=1):
+    num_pts_total = len(pts_xyz)
+
+    if num_pts_total == 0:
+        return {fr["image_id"]: [] for fr in frames}, []
+
+    if num_terrain_points is None or num_terrain_points <= 0 or num_terrain_points >= num_pts_total:
+        selected_indices = np.arange(num_pts_total, dtype=np.int64)
+    else:
+        # sous-échantillonnage régulier pour garder une bonne répartition
+        selected_indices = np.linspace(
+            0,
+            num_pts_total - 1,
+            num=num_terrain_points,
+            dtype=np.int64
+        )
+
+    selected_indices = np.unique(selected_indices)
+
     observations_by_image = {fr["image_id"]: [] for fr in frames}
-    tracks_by_point = [[] for _ in range(len(pts_xyz))]
+    tracks_by_point = [[] for _ in range(num_pts_total)]
 
-    for fr in frames:
-        image_id = fr["image_id"]
-        R_cw = fr["R_cw"]
-        t_cw = fr["tvec"]
-        width = fr["width"]
-        height = fr["height"]
-        fx = fr["fx"]
-        fy = fr["fy"]
-        cx = fr["cx"]
-        cy = fr["cy"]
-        transfo2d = fr.get("transfo2d")
+    log(
+        f"  Reprojection de {len(selected_indices)} point(s) terrain dans {len(frames)} image(s)...",
+        1,
+        verbose,
+    )
 
-        candidates = []
+    for local_count, pt_idx in enumerate(selected_indices, start=1):
+        xyz = pts_xyz[pt_idx]
+        point3d_id = int(pt_idx + 1)
 
-        for pid, xyz in enumerate(pts_xyz, start=1):
-            proj = project_point(R_cw, t_cw, fx, fy, cx, cy, xyz, transfo2d=transfo2d)
+        for fr in frames:
+            image_id = fr["image_id"]
+            R_cw = fr["R_cw"]
+            t_cw = fr["tvec"]
+            width = fr["width"]
+            height = fr["height"]
+            fx = fr["fx"]
+            fy = fr["fy"]
+            cx = fr["cx"]
+            cy = fr["cy"]
+            transfo2d = fr.get("transfo2d")
+
+            proj = project_point(
+                R_cw, t_cw, fx, fy, cx, cy, xyz, transfo2d=transfo2d
+            )
             if proj is None:
                 continue
 
@@ -312,31 +339,42 @@ def build_synthetic_observations(frames, pts_xyz, max_points_per_image=None, ver
             if not (0.0 <= u < width and 0.0 <= v < height):
                 continue
 
-            candidates.append({
-                "xy": uv,
-                "depth": depth,
-                "point3d_id": pid,
-            })
-
-        candidates.sort(key=lambda o: o["depth"])
-
-        if max_points_per_image is not None:
-            candidates = candidates[:max_points_per_image]
-
-        for obs in candidates:
             point2d_idx = len(observations_by_image[image_id])
 
             observations_by_image[image_id].append({
-                "xy": obs["xy"],
-                "point3d_id": obs["point3d_id"],
+                "xy": np.asarray(uv, dtype=np.float64),
+                "point3d_id": point3d_id,
             })
 
-            tracks_by_point[obs["point3d_id"] - 1].append({
-                "image_id": image_id,
-                "point2d_idx": point2d_idx,
+            tracks_by_point[pt_idx].append({
+                "image_id": int(image_id),
+                "point2d_idx": int(point2d_idx),
             })
 
-        log(f"  Image {image_id}: {len(candidates)} observations synthétiques", 1, verbose)
+        if local_count % 1000 == 0:
+            log(
+                f"  {local_count}/{len(selected_indices)} points terrain reprojetés...",
+                1,
+                verbose,
+            )
+
+    for track in tracks_by_point:
+        track.sort(key=lambda x: (x["image_id"], x["point2d_idx"]))
+
+    for fr in frames:
+        image_id = fr["image_id"]
+        log(
+            f"  Image {image_id}: {len(observations_by_image[image_id])} observations",
+            1,
+            verbose,
+        )
+
+    tracked_points = sum(1 for tr in tracks_by_point if len(tr) > 0)
+    log(
+        f"  Points terrain ayant au moins une observation: {tracked_points}",
+        1,
+        verbose,
+    )
 
     return observations_by_image, tracks_by_point
 
@@ -388,7 +426,7 @@ def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None, tracks_by_point=None):
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("# 3D point list with one line of data per point:\n")
-        f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
+        f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
         f.write(f"# Number of points: {len(pts_xyz)}\n")
 
         for i, (p, c, track) in enumerate(zip(pts_xyz, pts_rgb, tracks_by_point), start=1):
@@ -441,7 +479,116 @@ def build_transforms_json(path: Path, frames):
         json.dump(data, f, indent=2)
 
 
+def parse_images_txt_for_validation(path: Path):
+    images = {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    i = 0
+    while i < len(lines):
+        line1 = lines[i].strip()
+
+        if not line1 or line1.startswith("#"):
+            i += 1
+            continue
+
+        parts = line1.split()
+        if len(parts) < 10:
+            i += 1
+            continue
+
+        image_id = int(parts[0])
+        name = parts[9]
+
+        obs = []
+        line2 = ""
+        if i + 1 < len(lines):
+            line2 = lines[i + 1].strip()
+
+        if line2 and not line2.startswith("#"):
+            vals = line2.split()
+            if len(vals) % 3 != 0:
+                raise ValueError(
+                    f"images.txt invalide: image_id={image_id}, "
+                    f"la ligne POINTS2D ne contient pas un multiple de 3 valeurs"
+                )
+
+            for point2d_idx in range(len(vals) // 3):
+                x = float(vals[3 * point2d_idx + 0])
+                y = float(vals[3 * point2d_idx + 1])
+                point3d_id = int(vals[3 * point2d_idx + 2])
+
+                obs.append({
+                    "xy": (x, y),
+                    "point3d_id": point3d_id,
+                    "point2d_idx": point2d_idx,
+                })
+
+        images[image_id] = {
+            "name": name,
+            "observations": obs,
+        }
+
+        i += 2
+
+    return images
+    
+def parse_points3d_txt_for_validation(path: Path):
+    points = {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            parts = line.split()
+            if len(parts) < 8:
+                raise ValueError(
+                    f"points3D.txt invalide ligne {line_no}: moins de 8 champs"
+                )
+
+            point3d_id = int(parts[0])
+
+            track_parts = parts[8:]
+            if len(track_parts) % 2 != 0:
+                raise ValueError(
+                    f"points3D.txt invalide ligne {line_no}: "
+                    f"TRACK[] n'a pas un nombre pair d'éléments"
+                )
+
+            track = []
+            for i in range(0, len(track_parts), 2):
+                image_id = int(track_parts[i])
+                point2d_idx = int(track_parts[i + 1])
+                track.append((image_id, point2d_idx))
+
+            points[point3d_id] = {
+                "track": track
+            }
+
+    return points
+
 def try_write_colmap_bin(sparse_dir: Path, verbose: int):
+    images_txt = sparse_dir / "images.txt"
+    points3d_txt = sparse_dir / "points3D.txt"
+    cameras_txt = sparse_dir / "cameras.txt"
+
+    if not images_txt.exists() or not points3d_txt.exists() or not cameras_txt.exists():
+        log("[WARN] Fichiers texte COLMAP incomplets: conversion binaire ignorée.", 2, verbose)
+        return False
+
+    ok, errors, warnings = validate_colmap_text_model(
+        images_txt=images_txt,
+        points3d_txt=points3d_txt,
+        verbose=verbose,
+    )
+
+    if not ok:
+        log("[WARN] Le modèle texte est incohérent: conversion .bin annulée.", 1, verbose)
+        return False
+
     try:
         import pycolmap
     except ImportError:
@@ -455,9 +602,116 @@ def try_write_colmap_bin(sparse_dir: Path, verbose: int):
         log("[INFO] Fichiers .bin générés via pycolmap.", 1, verbose)
         return True
     except Exception as e:
-        log(f"[WARN] Impossible de générer les .bin avec pycolmap: {e}", 2, verbose)
+        log(f"[WARN] Impossible de générer les .bin avec pycolmap: {e}", 1, verbose)
         return False
 
+
+def validate_colmap_text_model(images_txt: Path, points3d_txt: Path, verbose: int = 1):
+    images = parse_images_txt_for_validation(images_txt)
+    points = parse_points3d_txt_for_validation(points3d_txt)
+
+    errors = []
+    warnings = []
+
+    # index inverse depuis images.txt
+    image_obs_lookup = {}
+    referenced_point_ids_from_images = set()
+
+    for image_id, im in images.items():
+        obs = im["observations"]
+        image_obs_lookup[image_id] = obs
+
+        for o in obs:
+            pid = o["point3d_id"]
+            if pid != -1:
+                referenced_point_ids_from_images.add(pid)
+
+    # Vérifie chaque track point3D -> image observation
+    for point3d_id, pdata in points.items():
+        track = pdata["track"]
+
+        for image_id, point2d_idx in track:
+            if image_id not in images:
+                errors.append(
+                    f"Point3D {point3d_id}: image_id {image_id} absent de images.txt"
+                )
+                continue
+
+            obs = image_obs_lookup[image_id]
+
+            if point2d_idx < 0 or point2d_idx >= len(obs):
+                errors.append(
+                    f"Point3D {point3d_id}: point2d_idx {point2d_idx} invalide "
+                    f"pour image_id {image_id} (taille={len(obs)})"
+                )
+                continue
+
+            linked_pid = obs[point2d_idx]["point3d_id"]
+            if linked_pid != point3d_id:
+                errors.append(
+                    f"Incohérence track: Point3D {point3d_id} -> "
+                    f"(image {image_id}, idx {point2d_idx}) "
+                    f"mais images.txt référence {linked_pid}"
+                )
+
+    # Vérifie chaque observation image -> point3D
+    for image_id, im in images.items():
+        for o in im["observations"]:
+            pid = o["point3d_id"]
+            idx = o["point2d_idx"]
+
+            if pid == -1:
+                continue
+
+            if pid not in points:
+                errors.append(
+                    f"Observation orpheline: image {image_id}, idx {idx} -> "
+                    f"point3D_id {pid} absent de points3D.txt"
+                )
+                continue
+
+            track = points[pid]["track"]
+            if (image_id, idx) not in track:
+                errors.append(
+                    f"Incohérence inverse: image {image_id}, idx {idx} -> point {pid}, "
+                    f"mais le track du point ne contient pas cette paire"
+                )
+
+    # Warnings utiles
+    points_without_track = [pid for pid, pdata in points.items() if len(pdata["track"]) == 0]
+    if points_without_track:
+        warnings.append(
+            f"{len(points_without_track)} point(s) 3D sans track"
+        )
+
+    image_obs_count = sum(len(im["observations"]) for im in images.values())
+    tracked_image_obs_count = sum(
+        1 for im in images.values() for o in im["observations"] if o["point3d_id"] != -1
+    )
+
+    if verbose >= 1:
+        log(
+            f"[VALIDATION] images={len(images)}, points3D={len(points)}, "
+            f"obs_total={image_obs_count}, obs_trackees={tracked_image_obs_count}",
+            1,
+            verbose,
+        )
+
+    for w in warnings:
+        log(f"[VALIDATION][WARN] {w}", 1, verbose)
+
+    if errors:
+        for e in errors[:50]:
+            log(f"[VALIDATION][ERROR] {e}", 1, verbose)
+
+        if len(errors) > 50:
+            log(f"[VALIDATION][ERROR] ... {len(errors) - 50} erreur(s) supplémentaire(s)", 1, verbose)
+
+        return False, errors, warnings
+
+    log("[VALIDATION] Modèle texte COLMAP cohérent.", 1, verbose)
+    return True, errors, warnings
+    
 
 def main():
     ap = argparse.ArgumentParser(
@@ -470,8 +724,8 @@ def main():
     ap.add_argument("--image-factor", type=float, default=1.0,
                     help="Facteur de sous-échantillonnage des images (2 = largeur/hauteur divisées par 2)")
     ap.add_argument("--jpeg-quality", type=int, default=95, help="Qualité JPEG de sortie")
-    ap.add_argument("--max-observations-per-image", type=int, default=5000,
-                    help="Nombre max d'observations synthétiques par image")
+    ap.add_argument("--num-terrain-points", type=int, default=5000,
+                    help="Nombre de points terrain à reprojeter dans toutes les images")
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                     help="0=silencieux, 1=info, 2=warn+info")
     args = ap.parse_args()
@@ -486,7 +740,7 @@ def main():
     if not decompression_script.exists():
         raise FileNotFoundError(f"Script introuvable: {decompression_script}")
 
-    out_images = out_dir / "colmap" / "images"
+    out_images = out_dir / "images"
     out_colmap = out_dir / "colmap"
     out_sparse = out_colmap / "sparse" / "0"
     out_models_0 = out_sparse / "models" / "0"
@@ -613,7 +867,8 @@ def main():
     observations_by_image, tracks_by_point = build_synthetic_observations(
         frames=frames,
         pts_xyz=pts_xyz,
-        max_points_per_image=args.max_observations_per_image,
+        pts_rgb=pts_rgb,
+        num_terrain_points=args.num_terrain_points,
         verbose=args.verbose,
     )
 
