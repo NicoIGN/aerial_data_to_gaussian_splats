@@ -5,7 +5,7 @@
 TRAINING_PROFILE="splat/PCRS"
 
 DEVICE="gpu"
-MODEL="splatfacto-big"
+MODEL="splatfacto"
 MODEL_IMPLEMENTATION="tcnn"
 TRAIN_VIS_MODE="tensorboard"
 
@@ -82,7 +82,7 @@ USE_BILATERAL_GRID=False
 USE_SCALE_REGULARIZATION=False
 
 # Limite la taille des covariances pour éviter des splats trop étalés
-MAX_GAUSS_RATIO=10.0
+MAX_GAUSS_RATIO=3.0
 
 # Équilibre entre fidélité visuelle et préservation de la structure de l’image
 # SSIM_LAMBDA=0.2
