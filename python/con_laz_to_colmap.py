@@ -68,6 +68,33 @@ def read_laz_points(laz_path: Path, stride: int):
     return xyz, rgb
 
 
+def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None):
+    n = len(xyz)
+    if rgb is None:
+        rgb = np.full((n, 3), 200, dtype=np.uint8)
+    else:
+        rgb = np.asarray(rgb)
+        if rgb.dtype != np.uint8:
+            rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {n}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+        for p, c in zip(xyz, rgb):
+            f.write(
+                f"{float(p[0]):.12f} {float(p[1]):.12f} {float(p[2]):.12f} "
+                f"{int(c[0])} {int(c[1])} {int(c[2])}\n"
+            )
+
+
 def run_decompression_script(script_path: Path, input_dir: Path, output_dir: Path,
                              factor: float, jpeg_quality: int, verbose: int):
     cmd = [
@@ -260,8 +287,7 @@ def scale_transfo2d(transfo2d, factor):
     scaled["C0"] = float(transfo2d.get("C0", 0.0)) / factor
     scaled["L0"] = float(transfo2d.get("L0", 0.0)) / factor
 
-    # S1/S2 sont des pentes en pixel/pixel dans cette formule affine simple le long des colonnes.
-    # Ils restent donc inchangés sous simple homothétie isotrope.
+    # S1/S2 restent inchangés sous simple homothétie isotrope.
     scaled["S1"] = float(transfo2d.get("S1", 0.0))
     scaled["S2"] = float(transfo2d.get("S2", 0.0))
 
@@ -292,7 +318,6 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
     if num_terrain_points is None or num_terrain_points <= 0 or num_terrain_points >= num_pts_total:
         selected_indices = np.arange(num_pts_total, dtype=np.int64)
     else:
-        # sous-échantillonnage régulier pour garder une bonne répartition
         selected_indices = np.linspace(
             0,
             num_pts_total - 1,
@@ -448,7 +473,46 @@ def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None, tracks_by_point=None):
             f.write(" ".join(parts) + "\n")
 
 
-def build_transforms_json(path: Path, frames):
+def compute_similarity_transform_from_pose_centers(centers: np.ndarray):
+    """
+    Calcule une normalisation de scène simple compatible avec les attentes de Nerfstudio:
+    - translation vers le centroïde
+    - scale global pour mettre la scène dans un rayon ~1
+    Retourne:
+      applied_transform_4x4, applied_scale
+    Tels que:
+      x_ns = applied_scale * (applied_transform_4x4 @ [x,1])[:3]
+    """
+    if len(centers) == 0:
+        T = np.eye(4, dtype=np.float64)
+        s = 1.0
+        return T, s
+
+    centroid = centers.mean(axis=0)
+    centered = centers - centroid
+    radii = np.linalg.norm(centered, axis=1)
+    max_radius = float(np.max(radii)) if len(radii) > 0 else 1.0
+    if max_radius < 1e-12:
+        max_radius = 1.0
+
+    T = np.eye(4, dtype=np.float64)
+    T[:3, 3] = -centroid
+    s = 1.0 / max_radius
+
+    return T, s
+
+
+def apply_transform_to_points(xyz: np.ndarray, T4: np.ndarray, scale: float):
+    if len(xyz) == 0:
+        return xyz.copy()
+
+    xyz_h = np.concatenate([xyz, np.ones((len(xyz), 1), dtype=np.float64)], axis=1)
+    xyz_t = (T4 @ xyz_h.T).T[:, :3]
+    xyz_t *= float(scale)
+    return xyz_t
+
+
+def build_transforms_json(path: Path, frames, applied_transform=None, applied_scale=None):
     if not frames:
         raise ValueError("Aucune frame pour transforms.json")
 
@@ -464,13 +528,28 @@ def build_transforms_json(path: Path, frames):
         "frames": []
     }
 
+    if applied_transform is not None:
+        data["applied_transform"] = np.asarray(applied_transform, dtype=np.float64).tolist()
+
+    if applied_scale is not None:
+        data["applied_scale"] = float(applied_scale)
+
     for fr in frames:
         T_c2w = np.eye(4, dtype=np.float64)
         T_c2w[:3, :3] = fr["R_cw"].T
         T_c2w[:3, 3] = fr["center"]
 
+        if applied_transform is not None:
+            T_c2w = np.asarray(applied_transform, dtype=np.float64) @ T_c2w
+
+        if applied_scale is not None:
+            T_c2w = T_c2w.copy()
+            T_c2w[:3, 3] *= float(applied_scale)
+
         data["frames"].append({
-            "file_path": f'images/{fr["frame_name"]}',
+            # Oui: si transforms.json est écrit dans out_colmap (= out_dir/colmap)
+            # et que les images sont dans out_dir/images, alors le chemin relatif correct est ../images/...
+            "file_path": f'../images/{fr["frame_name"]}',
             "transform_matrix": T_c2w.tolist(),
             "colmap_im_id": fr["image_id"],
         })
@@ -533,7 +612,8 @@ def parse_images_txt_for_validation(path: Path):
         i += 2
 
     return images
-    
+
+
 def parse_points3d_txt_for_validation(path: Path):
     points = {}
 
@@ -569,6 +649,7 @@ def parse_points3d_txt_for_validation(path: Path):
             }
 
     return points
+
 
 def try_write_colmap_bin(sparse_dir: Path, verbose: int):
     images_txt = sparse_dir / "images.txt"
@@ -613,7 +694,6 @@ def validate_colmap_text_model(images_txt: Path, points3d_txt: Path, verbose: in
     errors = []
     warnings = []
 
-    # index inverse depuis images.txt
     image_obs_lookup = {}
     referenced_point_ids_from_images = set()
 
@@ -626,7 +706,6 @@ def validate_colmap_text_model(images_txt: Path, points3d_txt: Path, verbose: in
             if pid != -1:
                 referenced_point_ids_from_images.add(pid)
 
-    # Vérifie chaque track point3D -> image observation
     for point3d_id, pdata in points.items():
         track = pdata["track"]
 
@@ -654,7 +733,6 @@ def validate_colmap_text_model(images_txt: Path, points3d_txt: Path, verbose: in
                     f"mais images.txt référence {linked_pid}"
                 )
 
-    # Vérifie chaque observation image -> point3D
     for image_id, im in images.items():
         for o in im["observations"]:
             pid = o["point3d_id"]
@@ -677,7 +755,6 @@ def validate_colmap_text_model(images_txt: Path, points3d_txt: Path, verbose: in
                     f"mais le track du point ne contient pas cette paire"
                 )
 
-    # Warnings utiles
     points_without_track = [pid for pid, pdata in points.items() if len(pdata["track"]) == 0]
     if points_without_track:
         warnings.append(
@@ -711,11 +788,11 @@ def validate_colmap_text_model(images_txt: Path, points3d_txt: Path, verbose: in
 
     log("[VALIDATION] Modèle texte COLMAP cohérent.", 1, verbose)
     return True, errors, warnings
-    
+
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Convertit un dossier images + fichiers .CON + LAZ vers une structure de sortie type COLMAP."
+        description="Convertit un dossier images + fichiers .CON + LAZ vers une structure de sortie type COLMAP / Nerfstudio."
     )
     ap.add_argument("--laz", required=True, help="Fichier .LAZ")
     ap.add_argument("--images", required=True, help="Dossier des images source")
@@ -744,11 +821,12 @@ def main():
     out_colmap = out_dir / "colmap"
     out_sparse = out_colmap / "sparse" / "0"
     out_models_0 = out_sparse / "models" / "0"
+    sparse_pc_ply = out_dir / "sparse_pc.ply"
 
     for d in [out_images, out_sparse, out_models_0]:
         ensure_dir(d)
 
-    log("[1/7] Indexation des images existantes...", 1, args.verbose)
+    log("[1/8] Indexation des images existantes...", 1, args.verbose)
     image_index = build_image_index(images_dir)
     log(f"  {len(image_index)} images indexées.", 1, args.verbose)
 
@@ -758,7 +836,7 @@ def main():
 
     factor = max(float(args.image_factor), 1.0)
 
-    log("[2/7] Décompression + sous-échantillonnage des images...", 1, args.verbose)
+    log("[2/8] Décompression + sous-échantillonnage des images...", 1, args.verbose)
     run_decompression_script(
         script_path=decompression_script,
         input_dir=images_dir,
@@ -771,7 +849,7 @@ def main():
     decompressed_index = build_image_index(out_images)
     log(f"  {len(decompressed_index)} images exportées indexées.", 1, args.verbose)
 
-    log("[3/7] Lecture des fichiers .CON...", 1, args.verbose)
+    log("[3/8] Lecture des fichiers .CON...", 1, args.verbose)
     frames = []
     intrinsics_ref = None
     skipped_no_con = 0
@@ -859,30 +937,51 @@ def main():
 
     width, height, fx, fy, cx, cy = intrinsics_ref
 
-    log("[4/7] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
-    pts_xyz, pts_rgb = read_laz_points(laz_path, args.subsample)
-    log(f"  {len(pts_xyz)} points conservés.", 1, args.verbose)
+    log("[4/8] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
+    pts_xyz_raw, pts_rgb = read_laz_points(laz_path, args.subsample)
+    log(f"  {len(pts_xyz_raw)} points conservés.", 1, args.verbose)
 
-    log("[5/7] Génération des observations synthétiques...", 1, args.verbose)
+    log("[5/8] Calcul de la normalisation de scène Nerfstudio...", 1, args.verbose)
+    centers = np.stack([fr["center"] for fr in frames], axis=0)
+    applied_transform, applied_scale = compute_similarity_transform_from_pose_centers(centers)
+
+    log(f"  applied_scale = {applied_scale:.12f}", 1, args.verbose)
+    log(f"  applied_transform =\n{applied_transform}", 1, args.verbose)
+
+    # On normalise les centres caméra pour le transforms.json
+    # mais on garde les poses COLMAP text/bin dans le repère source.
+    pts_xyz_ns = apply_transform_to_points(pts_xyz_raw, applied_transform, applied_scale)
+
+    log("[6/8] Génération des observations synthétiques...", 1, args.verbose)
     observations_by_image, tracks_by_point = build_synthetic_observations(
         frames=frames,
-        pts_xyz=pts_xyz,
+        pts_xyz=pts_xyz_raw,
         pts_rgb=pts_rgb,
         num_terrain_points=args.num_terrain_points,
         verbose=args.verbose,
     )
 
-    log("[6/7] Écriture cameras.txt, images.txt, points3D.txt...", 1, args.verbose)
+    log("[7/8] Écriture cameras.txt, images.txt, points3D.txt + sparse_pc.ply...", 1, args.verbose)
     write_cameras_txt_single_camera(out_sparse / "cameras.txt", width, height, fx, fy, cx, cy)
     write_images_txt(out_sparse / "images.txt", frames, observations_by_image)
-    write_points3D_txt(out_sparse / "points3D.txt", pts_xyz, pts_rgb, tracks_by_point)
+    write_points3D_txt(out_sparse / "points3D.txt", pts_xyz_raw, pts_rgb, tracks_by_point)
+    write_ply_xyzrgb(sparse_pc_ply, pts_xyz_ns, pts_rgb)
 
-    log("[7/7] Export transforms.json + conversion binaire...", 1, args.verbose)
-    build_transforms_json(out_colmap / "transforms.json", frames)
+    log("[8/8] Export transforms.json + conversion binaire...", 1, args.verbose)
+    build_transforms_json(
+        out_colmap / "transforms.json",
+        frames,
+        applied_transform=applied_transform,
+        applied_scale=applied_scale,
+    )
     try_write_colmap_bin(out_sparse, args.verbose)
 
     print("\nTerminé.")
     print(f"Sortie: {out_dir}")
+    print(f"Images: {out_images}")
+    print(f"COLMAP sparse: {out_sparse}")
+    print(f"Sparse PLY Nerfstudio: {sparse_pc_ply}")
+    print(f"Transforms Nerfstudio: {out_colmap / 'transforms.json'}")
 
 
 if __name__ == "__main__":
