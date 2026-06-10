@@ -525,6 +525,7 @@ def build_transforms_json(path: Path, frames, applied_transform=None, applied_sc
         "cx": first["cx"],
         "cy": first["cy"],
         "camera_model": "PINHOLE",
+        "ply_file_path": "sparse_pc.ply",
         "frames": []
     }
 
