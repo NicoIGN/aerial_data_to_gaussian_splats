@@ -559,7 +559,7 @@ def build_transforms_json(path: Path, frames, applied_transform=None, applied_sc
             T_c2w[:3, 3] *= float(applied_scale)
 
         data["frames"].append({
-            "file_path": f'../images/{fr["frame_name"]}',
+            "file_path": f'./images/{fr["frame_name"]}',
             "transform_matrix": T_c2w.tolist(),
             "colmap_im_id": fr["image_id"],
         })
@@ -979,7 +979,7 @@ def main():
 
     log("[8/8] Export transforms.json + conversion binaire...", 1, args.verbose)
     build_transforms_json(
-        out_colmap / "transforms.json",
+        out_dir / "transforms.json",
         frames,
         applied_transform=applied_transform,
         applied_scale=applied_scale,

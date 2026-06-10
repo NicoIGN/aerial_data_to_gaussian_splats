@@ -137,8 +137,8 @@ if [ ! -d "$IMAGE_DIR" ]; then
   exit 1
 fi
 
-if [ ! -d "$COLMAP_DIR/sparse/0" ]; then
-  echo "❌ Missing COLMAP sparse model: $COLMAP_DIR/sparse/0"
+if [ ! -d "$COLMAP_DIR/colmap/sparse/0" ]; then
+  echo "❌ Missing COLMAP sparse model: $COLMAP_DIR/colmap/sparse/0"
   exit 1
 fi
 
