@@ -16,8 +16,7 @@ TRAIN_VIS_MODE="tensorboard"
 # Stable full-res training
 CAMERA_RES_SCALE_FACTOR=1.0
 
-# Garde une résolution raisonnable
-MAX_RES=1280
+MAX_RES=10000
 
 NUM_DOWNSCALES=1
 SKIP_IMAGE_PROCESSING=true
@@ -27,7 +26,7 @@ SKIP_IMAGE_PROCESSING=true
 ########################################
 
 # Stable long training
-MAX_ITER=8000
+MAX_ITER=10000
 
 # IMPORTANT :
 # évite la densification tardive explosive
