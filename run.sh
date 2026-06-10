@@ -312,7 +312,7 @@ fi
 if [ "$SKIP_TRAINING" = true ]; then
   echo "⏩ Skipping training (config)"
 else
-    COLMAP_SPARSE_DIR="$COLMAP_DIR/sparse/0"
+    COLMAP_SPARSE_DIR="$COLMAP_DIR/colmap/sparse/0"
 
     if [ ! -d "$COLMAP_SPARSE_DIR" ]; then
       echo "❌ COLMAP directory not found: $COLMAP_SPARSE_DIR"
