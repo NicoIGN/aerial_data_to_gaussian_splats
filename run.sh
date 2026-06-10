@@ -421,6 +421,7 @@ else
 
   OUTPUT_DIR="$TRAIN_DIR/$EXPERIMENT_NAME" \
   EXPORT_DIR="$OUTPUT_DIR" \
+  ZIP_RUN=0 \
   bash scripts/export_splat_to_ply.sh
 
   PLY_FILE=$(find "$OUTPUT_DIR" -type f -name "*.ply" | head -n 1 || true)

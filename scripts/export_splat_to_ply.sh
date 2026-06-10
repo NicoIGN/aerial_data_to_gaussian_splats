@@ -4,6 +4,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 
+ZIP_RUN=${ZIP_RUN:-1}
+
 # ======================
 # CHECKS
 # ======================
@@ -60,27 +62,29 @@ mkdir -p "$EXPORT_DIR"
 # ======================
 # ZIP RUN DIRECTORY
 # ======================
-ZIP_PATH="$EXPORT_DIR/${RUN_NAME}.zip"
+if [[ "$ZIP_RUN" == "1" ]]; then
+    ZIP_PATH="$EXPORT_DIR/${RUN_NAME}.zip"
 
-if [ -f "$ZIP_PATH" ]; then
-  echo "⏭️ Zip already exists, skipping: $ZIP_PATH"
-else
-  echo "📦 Zipping run directory directly to export: $RUN_DIR"
+    if [ -f "$ZIP_PATH" ]; then
+      echo "⏭️ Zip already exists, skipping: $ZIP_PATH"
+    else
+      echo "📦 Zipping run directory directly to export: $RUN_DIR"
 
-  (
-    cd "$(dirname "$RUN_DIR")" && \
-    zip -r "$ZIP_PATH" "$RUN_NAME" > /dev/null
-  )
+      (
+        cd "$(dirname "$RUN_DIR")" && \
+        zip -r "$ZIP_PATH" "$RUN_NAME" > /dev/null
+      )
 
-  if [ -f "$ZIP_PATH" ]; then
+      if [ -f "$ZIP_PATH" ]; then
+        echo "✅ Archive created: $ZIP_PATH"
+      else
+        echo "❌ Failed to create zip archive in export dir"
+        exit 1
+      fi
+    fi
+
     echo "✅ Archive created: $ZIP_PATH"
-  else
-    echo "❌ Failed to create zip archive in export dir"
-    exit 1
-  fi
 fi
-
-echo "✅ Archive created: $ZIP_PATH"
 
 echo "────────────────────────────────────────────"
 echo "📦 SPLAT ROOT      : $SPLAT_ROOT"
