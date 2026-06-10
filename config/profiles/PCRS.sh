@@ -50,12 +50,10 @@ DENSIFY_GRAD_THRESH=100000
 # CLEANING
 ########################################
 
-# Nettoyage alpha un peu plus agressif
-CULL_ALPHA_THRESH=0.
+CULL_ALPHA_THRESH=0.01
 
 # Évite gros splats écran
 CULL_SCREEN_SIZE=0.15
-# SPLIT_SCREEN_SIZE=0.05
 
 ########################################
 # DENSIFICATION CONTROL

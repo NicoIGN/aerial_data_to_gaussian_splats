@@ -332,10 +332,6 @@ MODEL_ARGS=()
 #unset SPLIT_SCREEN_SIZE
   
 if [[ "$DEVICE" == "gpu" ]]; then
-
-    if [[ "$DEVICE" != "gpu" ]]; then  # debug
-        echo "deactivating custmized params"
-    else
         add_arg MODEL_ARGS       --pipeline.datamanager.camera-res-scale-factor "$CAMERA_RES_SCALE_FACTOR"
         add_arg MODEL_ARGS       --pipeline.datamanager.dataparser.downscale-factor "$DOWNSCALE_FACTOR"
         add_arg MODEL_ARGS       --pipeline.datamanager.cache-images cpu
@@ -354,6 +350,7 @@ if [[ "$DEVICE" == "gpu" ]]; then
         add_arg MODEL_ARGS       --pipeline.model.reset-alpha-every "$RESET_ALPHA_EVERY"
         add_arg MODEL_ARGS       --pipeline.model.ssim-lambda "$SSIM_LAMBDA"
         add_bool_arg MODEL_ARGS  --pipeline.model.enable-collider "$ENABLE_COLLIDER"
+        
 #        add_bool_arg MODEL_ARGS  --pipeline.model.continue_cull_post_densification "False"
 
         if [[ "$ENABLE_COLLIDER" == "True" ]]; then
@@ -368,7 +365,11 @@ if [[ "$DEVICE" == "gpu" ]]; then
           fi
 
         fi
-    fi
+        
+        if [[ "$STOP_SPLIT_AT" -eq 0 ]]; then
+            add_arg MODEL_ARGS --optimizers.means.optimizer.lr 0
+            add_arg MODEL_ARGS --pipeline.model.camera-optimizer.mode off
+        fi
 
 elif [[ "$DEVICE" == "cpu" ]]; then
     add_arg MODEL_ARGS --pipeline.datamanager.camera-res-scale-factor "$CAMERA_RES_SCALE_FACTOR"
