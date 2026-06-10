@@ -408,6 +408,26 @@ echo "💓 Heartbeat log     : $HEARTBEAT_LOG"
 HEARTBEAT_PID=$!
 
 # ======================
+# PIL LARGE IMAGE PATCH
+# ======================
+
+PIL_PATCH_DIR="$SCRIPT_DIR/.python_patches"
+mkdir -p "$PIL_PATCH_DIR"
+
+cat > "$PIL_PATCH_DIR/sitecustomize.py" <<'PYEOF'
+from PIL import Image
+import warnings
+
+# Autorise les très grandes images
+Image.MAX_IMAGE_PIXELS = None
+
+# Optionnel : masque le warning si jamais Pillow le déclenche encore ailleurs
+warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+PYEOF
+
+export PYTHONPATH="$PIL_PATCH_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
+# ======================
 # RUN TRAINING
 # ======================
 
