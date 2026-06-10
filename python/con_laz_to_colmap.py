@@ -528,8 +528,20 @@ def build_transforms_json(path: Path, frames, applied_transform=None, applied_sc
         "frames": []
     }
 
+    applied_transform_4x4 = None
     if applied_transform is not None:
-        data["applied_transform"] = np.asarray(applied_transform, dtype=np.float64).tolist()
+        applied_transform = np.asarray(applied_transform, dtype=np.float64)
+        if applied_transform.shape == (4, 4):
+            applied_transform_4x4 = applied_transform
+            data["applied_transform"] = applied_transform[:3, :4].tolist()
+        elif applied_transform.shape == (3, 4):
+            applied_transform_4x4 = np.eye(4, dtype=np.float64)
+            applied_transform_4x4[:3, :4] = applied_transform
+            data["applied_transform"] = applied_transform.tolist()
+        else:
+            raise ValueError(
+                f"applied_transform doit être 3x4 ou 4x4, reçu {applied_transform.shape}"
+            )
 
     if applied_scale is not None:
         data["applied_scale"] = float(applied_scale)
@@ -539,16 +551,14 @@ def build_transforms_json(path: Path, frames, applied_transform=None, applied_sc
         T_c2w[:3, :3] = fr["R_cw"].T
         T_c2w[:3, 3] = fr["center"]
 
-        if applied_transform is not None:
-            T_c2w = np.asarray(applied_transform, dtype=np.float64) @ T_c2w
+        if applied_transform_4x4 is not None:
+            T_c2w = applied_transform_4x4 @ T_c2w
 
         if applied_scale is not None:
             T_c2w = T_c2w.copy()
             T_c2w[:3, 3] *= float(applied_scale)
 
         data["frames"].append({
-            # Oui: si transforms.json est écrit dans out_colmap (= out_dir/colmap)
-            # et que les images sont dans out_dir/images, alors le chemin relatif correct est ../images/...
             "file_path": f'../images/{fr["frame_name"]}',
             "transform_matrix": T_c2w.tolist(),
             "colmap_im_id": fr["image_id"],
