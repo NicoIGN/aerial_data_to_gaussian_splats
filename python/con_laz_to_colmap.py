@@ -67,7 +67,6 @@ def read_laz_points(laz_path: Path, stride: int):
 
     return xyz, rgb
 
-
 def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None):
     n = len(xyz)
     if rgb is None:
@@ -76,6 +75,13 @@ def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None)
         rgb = np.asarray(rgb)
         if rgb.dtype != np.uint8:
             rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    # Conversion d'axes observée sur les datasets COLMAP/Nerfstudio fonctionnels :
+    # (x, y, z) -> (x, z, -y)
+    xyz_out = np.empty_like(xyz, dtype=np.float64)
+    xyz_out[:, 0] = xyz[:, 0]
+    xyz_out[:, 1] = xyz[:, 2]
+    xyz_out[:, 2] = -xyz[:, 1]
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("ply\n")
@@ -88,7 +94,7 @@ def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None)
         f.write("property uchar green\n")
         f.write("property uchar blue\n")
         f.write("end_header\n")
-        for p, c in zip(xyz, rgb):
+        for p, c in zip(xyz_out, rgb):
             f.write(
                 f"{float(p[0]):.12f} {float(p[1]):.12f} {float(p[2]):.12f} "
                 f"{int(c[0])} {int(c[1])} {int(c[2])}\n"
