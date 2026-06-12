@@ -508,7 +508,7 @@ if [[ ! -f "$PLY_FILE" ]]; then
   exit 1
 fi
 
-COLMAP_POINTS="$COLMAP_DIR/sparse/0/points3D.bin"
+COLMAP_POINTS="$COLMAP_DIR/colmap/sparse/0/points3D.bin"
 
 if [[ ! -f "$COLMAP_POINTS" ]]; then
   echo "❌ COLMAP points not found: $COLMAP_POINTS"
