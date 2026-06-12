@@ -668,6 +668,40 @@ def parse_points3d_txt_for_validation(path: Path):
     return points
 
 
+def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by_image):
+    """
+    Conserve uniquement les points ayant au moins une observation.
+    Recrée des POINT3D_ID compacts à partir de 1 et met à jour observations_by_image.
+    """
+    kept_old_indices = [i for i, tr in enumerate(tracks_by_point) if len(tr) > 0]
+
+    if len(kept_old_indices) == 0:
+        pts_xyz_kept = pts_xyz[:0].copy()
+        pts_rgb_kept = None if pts_rgb is None else pts_rgb[:0].copy()
+        tracks_kept = []
+        observations_new = {k: [] for k in observations_by_image}
+        return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new
+
+    old_to_new_id = {old_idx + 1: new_id for new_id, old_idx in enumerate(kept_old_indices, start=1)}
+
+    pts_xyz_kept = pts_xyz[kept_old_indices]
+    pts_rgb_kept = None if pts_rgb is None else pts_rgb[kept_old_indices]
+    tracks_kept = [tracks_by_point[i] for i in kept_old_indices]
+
+    observations_new = {}
+    for image_id, obs_list in observations_by_image.items():
+        new_obs_list = []
+        for obs in obs_list:
+            old_pid = obs["point3d_id"]
+            if old_pid in old_to_new_id:
+                new_obs = dict(obs)
+                new_obs["point3d_id"] = old_to_new_id[old_pid]
+                new_obs_list.append(new_obs)
+        observations_new[image_id] = new_obs_list
+
+    return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new
+    
+
 def try_write_colmap_bin(sparse_dir: Path, verbose: int):
     images_txt = sparse_dir / "images.txt"
     points3d_txt = sparse_dir / "points3D.txt"
@@ -977,22 +1011,44 @@ def main():
         num_terrain_points=args.num_terrain_points,
         verbose=args.verbose,
     )
+    
+    pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_by_image = filter_points_with_tracks(
+        pts_xyz=pts_xyz_raw,
+        pts_rgb=pts_rgb,
+        tracks_by_point=tracks_by_point,
+        observations_by_image=observations_by_image,
+    )
 
-    log("[7/8] Écriture cameras.txt, images.txt, points3D.txt + sparse_pc.ply...", 1, args.verbose)
+    log(f"  Points 3D exportés avec tracks: {len(pts_xyz_kept)}", 1, args.verbose)
+
+    log(f"[7/8] Écriture cameras.txt, images.txt, points3D.txt + sparse_pc.ply...", 1, args.verbose)
     write_cameras_txt_single_camera(out_sparse / "cameras.txt", width, height, fx, fy, cx, cy)
     write_images_txt(out_sparse / "images.txt", frames, observations_by_image)
-    write_points3D_txt(out_sparse / "points3D.txt", pts_xyz_raw, pts_rgb, tracks_by_point)
-    write_ply_xyzrgb(sparse_pc_ply, pts_xyz_ns, pts_rgb)
+    write_points3D_txt(out_sparse / "points3D.txt", pts_xyz_kept, pts_rgb_kept, tracks_kept)
+    pts_xyz_kept_ns = apply_transform_to_points(pts_xyz_kept, applied_transform, applied_scale)
+    write_ply_xyzrgb(sparse_pc_ply, pts_xyz_kept_ns, pts_rgb_kept)
 
-    log("[8/8] Export transforms.json + conversion binaire...", 1, args.verbose)
+    log(f"[8/8] Export transforms.json + conversion binaire...", 1, args.verbose)
     build_transforms_json(
         out_dir / "transforms.json",
         frames,
         applied_transform=applied_transform,
         applied_scale=applied_scale,
     )
-    try_write_colmap_bin(out_sparse, args.verbose)
 
+    bin_ok = try_write_colmap_bin(out_sparse, args.verbose)
+
+    if bin_ok:
+        for txt_name in ("cameras.txt", "images.txt", "points3D.txt"):
+            txt_path = out_sparse / txt_name
+            try:
+                txt_path.unlink()
+                log(f"[INFO] Supprimé après conversion binaire: {txt_path}", 1, args.verbose)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                log(f"[WARN] Impossible de supprimer {txt_path}: {e}", 1, args.verbose)
+            
     print("\nTerminé.")
     print(f"Sortie: {out_dir}")
     print(f"Images: {out_images}")
