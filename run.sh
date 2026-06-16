@@ -361,6 +361,7 @@ else
         HTTP_PROXY="$HTTP_PROXY" \
         HTTPS_PROXY="$HTTPS_PROXY" \
         NO_PROXY="$NO_PROXY" \
+        VERBOSE="True" \
         MODEL="$MODEL" \
         MODEL_IMPLEMENTATION="$MODEL_IMPLEMENTATION" \
         DEVICE="$DEVICE" \

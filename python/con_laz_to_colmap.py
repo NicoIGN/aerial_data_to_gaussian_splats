@@ -473,49 +473,37 @@ def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None, tracks_by_point=None):
             f.write(" ".join(parts) + "\n")
 
 
-def compute_scene_normalization_from_pose_centers_and_points(centers: np.ndarray, pts_xyz: np.ndarray):
-    """
-    Retourne une normalisation globale unique:
-      Xn = (X - origin) * scale
-
-    origin: centroïde des centres caméra
-    scale: inverse du rayon max couvrant caméras + points
-    """
+def compute_similarity_transform_from_pose_centers(centers: np.ndarray):
     if len(centers) == 0:
-        origin = np.zeros(3, dtype=np.float64)
-        scale = 1.0
         T = np.eye(4, dtype=np.float64)
-        return origin, scale, T
+        s = 1.0
+        return T, s
 
-    origin = centers.mean(axis=0)
-
-    dists = [np.linalg.norm(centers - origin, axis=1)]
-    if pts_xyz is not None and len(pts_xyz) > 0:
-        dists.append(np.linalg.norm(pts_xyz - origin, axis=1))
-
-    max_radius = float(np.max(np.concatenate(dists))) if len(dists) > 0 else 1.0
+    centroid = centers.mean(axis=0)
+    centered = centers - centroid
+    radii = np.linalg.norm(centered, axis=1)
+    max_radius = float(np.max(radii)) if len(radii) > 0 else 1.0
     if max_radius < 1e-12:
         max_radius = 1.0
 
-    scale = 1.0 / max_radius
-
     T = np.eye(4, dtype=np.float64)
-    T[:3, 3] = -origin
+    T[:3, 3] = -centroid
+    s = 1.0 / max_radius
 
-    return origin, scale, T
+    return T, s
 
 
-def normalize_points(xyz: np.ndarray, origin: np.ndarray, scale: float):
+def apply_transform_to_points(xyz: np.ndarray, T4: np.ndarray, scale: float):
     if len(xyz) == 0:
         return xyz.copy()
-    return (xyz - origin[None, :]) * float(scale)
+
+    xyz_h = np.concatenate([xyz, np.ones((len(xyz), 1), dtype=np.float64)], axis=1)
+    xyz_t = (T4 @ xyz_h.T).T[:, :3]
+    xyz_t *= float(scale)
+    return xyz_t
 
 
-def normalize_center(center: np.ndarray, origin: np.ndarray, scale: float):
-    return (center - origin) * float(scale)
-
-
-def build_transforms_json(path: Path, frames, normalization_info=None):
+def build_transforms_json(path: Path, frames, applied_transform=None, applied_scale=None):
     if not frames:
         raise ValueError("Aucune frame pour transforms.json")
 
@@ -532,13 +520,35 @@ def build_transforms_json(path: Path, frames, normalization_info=None):
         "frames": []
     }
 
-    if normalization_info is not None:
-        data["scene_normalization"] = normalization_info
+    applied_transform_4x4 = None
+    if applied_transform is not None:
+        applied_transform = np.asarray(applied_transform, dtype=np.float64)
+        if applied_transform.shape == (4, 4):
+            applied_transform_4x4 = applied_transform
+            data["applied_transform"] = applied_transform[:3, :4].tolist()
+        elif applied_transform.shape == (3, 4):
+            applied_transform_4x4 = np.eye(4, dtype=np.float64)
+            applied_transform_4x4[:3, :4] = applied_transform
+            data["applied_transform"] = applied_transform.tolist()
+        else:
+            raise ValueError(
+                f"applied_transform doit être 3x4 ou 4x4, reçu {applied_transform.shape}"
+            )
+
+    if applied_scale is not None:
+        data["applied_scale"] = float(applied_scale)
 
     for fr in frames:
         T_c2w = np.eye(4, dtype=np.float64)
         T_c2w[:3, :3] = fr["R_cw"].T
         T_c2w[:3, 3] = fr["center"]
+
+        if applied_transform_4x4 is not None:
+            T_c2w = applied_transform_4x4 @ T_c2w
+
+        if applied_scale is not None:
+            T_c2w = T_c2w.copy()
+            T_c2w[:3, 3] *= float(applied_scale)
 
         data["frames"].append({
             "file_path": f'./images/{fr["frame_name"]}',
@@ -550,16 +560,15 @@ def build_transforms_json(path: Path, frames, normalization_info=None):
         json.dump(data, f, indent=2)
 
 
-def write_scene_normalization_json(path: Path, origin: np.ndarray, scale: float):
-    T = np.eye(4, dtype=np.float64)
-    T[:3, 3] = -origin
+def write_scene_normalization_json(path: Path, T4: np.ndarray, scale: float, centers: np.ndarray):
+    centroid = centers.mean(axis=0) if len(centers) > 0 else np.zeros(3, dtype=np.float64)
 
     data = {
-        "origin_world": origin.tolist(),
+        "origin_world": centroid.tolist(),
         "scale": float(scale),
-        "translation_matrix_4x4": T.tolist(),
-        "formula_points": "X_normalized = (X_world - origin_world) * scale",
-        "formula_camera_centers": "C_normalized = (C_world - origin_world) * scale",
+        "translation_matrix_4x4": T4.tolist(),
+        "formula_points": "X_normalized = scale * (T @ [X_world, 1])[:3]",
+        "formula_camera_centers": "C_normalized = scale * (T @ [C_world, 1])[:3]",
     }
 
     with open(path, "w", encoding="utf-8") as f:
@@ -660,10 +669,6 @@ def parse_points3d_txt_for_validation(path: Path):
 
 
 def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by_image):
-    """
-    Conserve uniquement les points ayant au moins une observation.
-    Recrée des POINT3D_ID compacts à partir de 1 et met à jour observations_by_image.
-    """
     kept_old_indices = [i for i, tr in enumerate(tracks_by_point) if len(tr) > 0]
 
     if len(kept_old_indices) == 0:
@@ -869,7 +874,7 @@ def main():
     for d in [out_images, out_sparse, out_models_0]:
         ensure_dir(d)
 
-    log("[1/9] Indexation des images existantes...", 1, args.verbose)
+    log("[1/8] Indexation des images existantes...", 1, args.verbose)
     image_index = build_image_index(images_dir)
     log(f"  {len(image_index)} images indexées.", 1, args.verbose)
 
@@ -879,7 +884,7 @@ def main():
 
     factor = max(float(args.image_factor), 1.0)
 
-    log("[2/9] Décompression + sous-échantillonnage des images...", 1, args.verbose)
+    log("[2/8] Décompression + sous-échantillonnage des images...", 1, args.verbose)
     run_decompression_script(
         script_path=decompression_script,
         input_dir=images_dir,
@@ -892,7 +897,7 @@ def main():
     decompressed_index = build_image_index(out_images)
     log(f"  {len(decompressed_index)} images exportées indexées.", 1, args.verbose)
 
-    log("[3/9] Lecture des fichiers .CON...", 1, args.verbose)
+    log("[3/8] Lecture des fichiers .CON...", 1, args.verbose)
     frames = []
     intrinsics_ref = None
     skipped_no_con = 0
@@ -950,10 +955,9 @@ def main():
             "frame_name": exported_img.name,
             "source_image": str(src_img),
             "con_path": str(con_path),
-            "center_world": ori["center"].copy(),
-            "center": ori["center"].copy(),
+            "center": ori["center"],
             "qvec": ori["qvec"],
-            "tvec": ori["tvec"].copy(),
+            "tvec": ori["tvec"],
             "R_cw": ori["R_cw"],
             "width": width,
             "height": height,
@@ -981,38 +985,21 @@ def main():
 
     width, height, fx, fy, cx, cy = intrinsics_ref
 
-    log("[4/9] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
+    log("[4/8] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
     pts_xyz_raw, pts_rgb = read_laz_points(laz_path, args.subsample)
     log(f"  {len(pts_xyz_raw)} points conservés.", 1, args.verbose)
 
-    log("[5/9] Calcul de la normalisation de scène...", 1, args.verbose)
-    centers_world = np.stack([fr["center_world"] for fr in frames], axis=0)
-    origin_world, scene_scale, T_translate = compute_scene_normalization_from_pose_centers_and_points(
-        centers_world, pts_xyz_raw
-    )
-
-    log(f"  origin_world = {origin_world}", 1, args.verbose)
-    log(f"  scene_scale = {scene_scale:.12f}", 1, args.verbose)
-
-    pts_xyz = normalize_points(pts_xyz_raw, origin_world, scene_scale)
-
-    for fr in frames:
-        fr["center"] = normalize_center(fr["center_world"], origin_world, scene_scale)
-        fr["tvec"] = -fr["R_cw"] @ fr["center"]
-
-    write_scene_normalization_json(normalization_json, origin_world, scene_scale)
-
-    log("[6/9] Génération des observations synthétiques...", 1, args.verbose)
+    log("[5/8] Génération des observations synthétiques (repère COLMAP source)...", 1, args.verbose)
     observations_by_image, tracks_by_point = build_synthetic_observations(
         frames=frames,
-        pts_xyz=pts_xyz,
+        pts_xyz=pts_xyz_raw,
         pts_rgb=pts_rgb,
         num_terrain_points=args.num_terrain_points,
         verbose=args.verbose,
     )
 
     pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_by_image = filter_points_with_tracks(
-        pts_xyz=pts_xyz,
+        pts_xyz=pts_xyz_raw,
         pts_rgb=pts_rgb,
         tracks_by_point=tracks_by_point,
         observations_by_image=observations_by_image,
@@ -1020,24 +1007,36 @@ def main():
 
     log(f"  Points 3D exportés avec tracks: {len(pts_xyz_kept)}", 1, args.verbose)
 
-    log(f"[7/9] Écriture cameras.txt, images.txt, points3D.txt + sparse_pc.ply...", 1, args.verbose)
+    log("[6/8] Calcul de la normalisation Nerfstudio (transforms + PLY uniquement)...", 1, args.verbose)
+    centers = np.stack([fr["center"] for fr in frames], axis=0)
+    applied_transform, applied_scale = compute_similarity_transform_from_pose_centers(centers)
+
+    log(f"  applied_scale = {applied_scale:.12f}", 1, args.verbose)
+    log(f"  applied_transform =\n{applied_transform}", 1, args.verbose)
+
+    pts_xyz_kept_ns = apply_transform_to_points(pts_xyz_kept, applied_transform, applied_scale)
+
+    write_scene_normalization_json(
+        normalization_json,
+        applied_transform,
+        applied_scale,
+        centers,
+    )
+
+    log(f"[7/8] Écriture cameras.txt, images.txt, points3D.txt + sparse_pc.ply...", 1, args.verbose)
     write_cameras_txt_single_camera(out_sparse / "cameras.txt", width, height, fx, fy, cx, cy)
     write_images_txt(out_sparse / "images.txt", frames, observations_by_image)
     write_points3D_txt(out_sparse / "points3D.txt", pts_xyz_kept, pts_rgb_kept, tracks_kept)
-    write_ply_xyzrgb(sparse_pc_ply, pts_xyz_kept, pts_rgb_kept)
+    write_ply_xyzrgb(sparse_pc_ply, pts_xyz_kept_ns, pts_rgb_kept)
 
-    log(f"[8/9] Export transforms.json...", 1, args.verbose)
-    normalization_info = {
-        "origin_world": origin_world.tolist(),
-        "scale": float(scene_scale),
-    }
+    log(f"[8/8] Export transforms.json + conversion binaire...", 1, args.verbose)
     build_transforms_json(
         out_dir / "transforms.json",
         frames,
-        normalization_info=normalization_info,
+        applied_transform=applied_transform,
+        applied_scale=applied_scale,
     )
 
-    log(f"[9/9] Conversion binaire COLMAP...", 1, args.verbose)
     bin_ok = try_write_colmap_bin(out_sparse, args.verbose)
 
     if bin_ok:

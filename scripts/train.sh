@@ -70,6 +70,8 @@ fi
 # DEFAULTS
 # ======================
 
+VERBOSE=${VERBOSE:-False}
+
 TRAIN_VIS_MODE=${TRAIN_VIS_MODE:-tensorboard}
 
 STEPS_PER_SAVE=${STEPS_PER_SAVE:-5000}
@@ -383,6 +385,27 @@ elif [[ "$DEVICE" == "cpu" ]]; then
     fi
 fi
 
+
+# ======================
+# LOGGING ARGS
+# ======================
+LOGGING_ARGS=()
+
+if [[ "$VERBOSE" == "True" || "$VERBOSE" == "true" || "$VERBOSE" == "1" ]]; then
+  echo "🔎 VERBOSE mode enabled"
+
+  add_arg LOGGING_ARGS --logging.local-writer.max-log-size 0
+  add_bool_arg LOGGING_ARGS --logging.profiler.enable True
+
+  export LOGLEVEL=DEBUG
+  export PYTHONUNBUFFERED=1
+  export NCCL_DEBUG=INFO
+else
+  export LOGLEVEL=INFO
+fi
+
+
+
 # ======================
 # LOGGING
 # ======================
@@ -449,6 +472,7 @@ set +e
 ns-train \
   "$MODEL" \
   "${COMMON_ARGS[@]}" \
+  "${LOGGING_ARGS[@]}" \
   "${PERF_ARGS[@]}" \
   "${MODEL_ARGS[@]}" \
   nerfstudio-data \
