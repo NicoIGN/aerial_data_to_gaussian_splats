@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import numpy as np
 
 from plyfile import PlyData, PlyElement
 
@@ -73,7 +74,7 @@ def main():
 
             original_count = len(data)
 
-            data = data[::args.subsample]
+            data = data[::args.subsample].copy()
 
             print(
                 f"    Sous-échantillonnage 1/{args.subsample}: "
