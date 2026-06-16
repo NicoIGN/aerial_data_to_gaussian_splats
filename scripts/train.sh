@@ -395,7 +395,6 @@ if [[ "$VERBOSE" == "True" || "$VERBOSE" == "true" || "$VERBOSE" == "1" ]]; then
   echo "🔎 VERBOSE mode enabled"
 
   add_arg LOGGING_ARGS --logging.local-writer.max-log-size 0
-  add_bool_arg LOGGING_ARGS --logging.profiler.enable True
 
   export LOGLEVEL=DEBUG
   export PYTHONUNBUFFERED=1
