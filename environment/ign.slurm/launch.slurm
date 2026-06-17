@@ -32,6 +32,7 @@ VERBOSE="${VERBOSE:-false}"
 export SRUN_CPUS_PER_TASK=8
 export NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
+export PYTHONUNBUFFERED=1
 
 # =========================
 # PROXY / ENV
@@ -201,7 +202,7 @@ fi
 # =========================
 # RUN TRAINING
 # =========================
-srun -v bash run.sh \
+srun --unbuffered -v bash run.sh \
   --root "$ROOTDIR" \
   --name "$BASENAME" \
   --colmap-dir "$COLMAP_DIR" \

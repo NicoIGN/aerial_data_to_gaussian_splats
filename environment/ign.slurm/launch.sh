@@ -53,8 +53,8 @@ log "========================"
 log "📤 SUBMITTING JOB"
 log "========================"
 
-OUT=$(sbatch "$LAUNCH_SLURM")
-log "$OUT"
+#OUT=$(sbatch "$LAUNCH_SLURM")
+#log "$OUT"
 
 JOB_ID=$(echo "$OUT" | awk '{print $4}')
 
@@ -92,11 +92,11 @@ log "========================"
 
 if [ "$VERBOSE" = "true" ]; then
   log "Verbose mode enabled → full logs"
-  tail -n +1 -f "$STDOUT_LOG" "$STDERR_LOG" &
+  tail -n0 -F "$STDOUT_LOG" "$STDERR_LOG" &
 else
   log "Verbose mode disabled → filtered logs"
 
-    tail -n +1 -f "$STDOUT_LOG" "$STDERR_LOG" 2>/dev/null \
+    tail -n0 -F "$STDOUT_LOG" "$STDERR_LOG" 2>/dev/null \
       | grep -vE \
     'RESOURCE SNAPSHOT|memory\.total|memory\.used|memory\.free|utilization\.gpu|used_gpu_memory|^Mem:|^Swap:|^pid, process_name|^index, name|^==> .* <==$|[0-9]+(\.[0-9]+)?it/s|step=[0-9]+|epoch=[0-9]+|loss=' \
       || true &
