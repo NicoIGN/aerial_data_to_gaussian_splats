@@ -53,8 +53,8 @@ log "========================"
 log "📤 SUBMITTING JOB"
 log "========================"
 
-#OUT=$(sbatch "$LAUNCH_SLURM")
-#log "$OUT"
+OUT=$(sbatch "$LAUNCH_SLURM")
+log "$OUT"
 
 JOB_ID=$(echo "$OUT" | awk '{print $4}')
 
