@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=gsplat
 #SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
@@ -10,7 +11,7 @@
 #SBATCH -o /mnt/common/hdd/slurm/logs/gsplat-%j.out
 #SBATCH -e /mnt/common/hdd/slurm/logs/gsplat-%j.err
 
-set -e
+set -euo pipefail
 # set -x
 
 # =========================
@@ -29,7 +30,7 @@ VERBOSE="${VERBOSE:-false}"
 # =========================
 # SRUN / SLURM SETTINGS
 # =========================
-export SRUN_CPUS_PER_TASK=8
+export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
 export NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
 export PYTHONUNBUFFERED=1
@@ -37,16 +38,17 @@ export PYTHONUNBUFFERED=1
 # =========================
 # PROXY / ENV
 # =========================
-export HTTP_PROXY
-export HTTPS_PROXY
-export http_proxy
-export https_proxy
-export NO_PROXY
-export MAX_JOBS
+export HTTP_PROXY="${HTTP_PROXY:-}"
+export HTTPS_PROXY="${HTTPS_PROXY:-}"
+export http_proxy="${http_proxy:-}"
+export https_proxy="${https_proxy:-}"
+export NO_PROXY="${NO_PROXY:-}"
+export MAX_JOBS="${MAX_JOBS:-}"
 
 # =========================
 # MATPLOTLIB CACHE
 # =========================
+: "${HOME_SLURM:=$HOME}"
 export MPLCONFIGDIR="$HOME_SLURM/.config/matplotlib"
 mkdir -p "$MPLCONFIGDIR"
 
@@ -59,12 +61,12 @@ if [ ! -d "$GIT_ROOT" ]; then
     echo "❌ GIT_ROOT does not exist or is not a directory: $GIT_ROOT"
     exit 1
 fi
-cd $GIT_ROOT
+cd "$GIT_ROOT"
 
 # =========================
 # CONDA ENV
 # =========================
-CONDA_BASE=$(conda info --base 2>/dev/null || echo "")
+CONDA_BASE="$(conda info --base 2>/dev/null || echo "")"
 if [ -z "$CONDA_BASE" ]; then
     echo "❌ conda not found"
     exit 1
@@ -128,6 +130,7 @@ echo "BASENAME=$BASENAME"
 echo "GSPLAT_PROFILE=$GSPLAT_PROFILE"
 echo "COLMAP_DIR=$COLMAP_DIR"
 echo "IMAGE_DIR=$IMAGE_DIR"
+echo "VERBOSE=$VERBOSE"
 
 python - <<'PY'
 import torch
@@ -172,37 +175,54 @@ echo "🧾 SLURM JOB INFO"
 echo "========================"
 scontrol show job "${SLURM_JOB_ID}" || true
 
+echo
+echo "========================"
+echo "🔧 SLURM TASK SETTINGS"
+echo "========================"
+echo "SLURM_JOB_ID=${SLURM_JOB_ID:-<unset>}"
+echo "SLURM_NTASKS=${SLURM_NTASKS:-<unset>}"
+echo "SLURM_NTASKS_PER_NODE=${SLURM_NTASKS_PER_NODE:-<unset>}"
+echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-<unset>}"
+echo "SRUN_CPUS_PER_TASK=${SRUN_CPUS_PER_TASK:-<unset>}"
+
 # =========================
 # OPTIONAL BACKGROUND MONITOR
 # =========================
+MONITOR_PID=""
 if [ "$VERBOSE" = "true" ]; then
     (
-      while true; do
-        echo
-        echo "========================"
-        echo "⏱ RESOURCE SNAPSHOT $(date)"
-        echo "========================"
-        free -h || true
-        echo
-        if command -v nvidia-smi >/dev/null 2>&1; then
-            nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu --format=csv || true
+        while true; do
             echo
-            nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid,used_gpu_memory --format=csv || true
-        fi
-        sleep 120
-      done
+            echo "========================"
+            echo "⏱ RESOURCE SNAPSHOT $(date)"
+            echo "========================"
+            free -h || true
+            echo
+            if command -v nvidia-smi >/dev/null 2>&1; then
+                nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu --format=csv || true
+                echo
+                nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid,used_gpu_memory --format=csv || true
+            fi
+            sleep 120
+        done
     ) &
     MONITOR_PID=$!
 
     cleanup() {
-        kill "$MONITOR_PID" 2>/dev/null || true
+        if [ -n "${MONITOR_PID:-}" ]; then
+            kill "$MONITOR_PID" 2>/dev/null || true
+        fi
     }
     trap cleanup EXIT
 fi
+
 # =========================
 # RUN TRAINING
 # =========================
-srun --unbuffered -v bash run.sh \
+srun --unbuffered -v \
+  --ntasks=1 \
+  --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}" \
+  bash run.sh \
   --root "$ROOTDIR" \
   --name "$BASENAME" \
   --colmap-dir "$COLMAP_DIR" \
