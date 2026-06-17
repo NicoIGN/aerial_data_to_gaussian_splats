@@ -17,31 +17,22 @@ SUBMIT_LOG="$LOG_DIR/submit.log"
 
 mkdir -p "$LOG_DIR"
 
-# Log terminal + fichier
+# terminal + file
 exec > >(tee -a "$SUBMIT_LOG") 2>&1
 
 log() {
   echo "$@"
 }
 
-verbose_log() {
-  [ "$VERBOSE" = "true" ] && echo "$@"
-}
-
 log "========================"
-log "🚀 PRE-SUBMISSION CHECK"
+log "🚀 SUBMIT CHECK"
 log "========================"
-log "date         : $(date)"
-log "host         : $(hostname)"
-log "user         : $(whoami)"
-log "pwd          : $(pwd)"
-log "GIT_ROOT     : $GIT_ROOT"
-log "launch.slurm : $LAUNCH_SLURM"
-log "run.sh       : $RUN_SH"
-log "config.sh    : $CONFIG_SH"
-log "log dir      : $LOG_DIR"
-log "submit log   : $SUBMIT_LOG"
-log "verbose      : $VERBOSE"
+log "date      : $(date)"
+log "host      : $(hostname)"
+log "user      : $(whoami)"
+log "pwd       : $(pwd)"
+log "GIT_ROOT  : $GIT_ROOT"
+log "verbose   : $VERBOSE"
 
 [ -d "$GIT_ROOT" ] || { log "❌ GIT_ROOT not found: $GIT_ROOT"; exit 1; }
 [ -f "$LAUNCH_SLURM" ] || { log "❌ launch.slurm missing: $LAUNCH_SLURM"; exit 1; }
@@ -50,13 +41,13 @@ log "verbose      : $VERBOSE"
 
 log
 log "========================"
-log "📤 SUBMITTING JOB"
+log "📤 SUBMITTING"
 log "========================"
 
-OUT=$(sbatch "$LAUNCH_SLURM")
+OUT="$(sbatch "$LAUNCH_SLURM")"
 log "$OUT"
 
-JOB_ID=$(echo "$OUT" | awk '{print $4}')
+JOB_ID="$(echo "$OUT" | sed -n 's/.*Submitted batch job \([0-9]\+\).*/\1/p')"
 
 if [ -z "${JOB_ID:-}" ]; then
   log "❌ Could not parse job ID from sbatch output"
@@ -66,10 +57,10 @@ fi
 STDOUT_LOG="$LOG_DIR/gsplat-$JOB_ID.out"
 STDERR_LOG="$LOG_DIR/gsplat-$JOB_ID.err"
 
-log "✅ Submitted job $JOB_ID"
-log "📄 stdout: $STDOUT_LOG"
-log "📄 stderr: $STDERR_LOG"
-log "🔎 queue: squeue -j $JOB_ID"
+log "job id    : $JOB_ID"
+log "stdout    : $STDOUT_LOG"
+log "stderr    : $STDERR_LOG"
+log "queue cmd : squeue -j $JOB_ID"
 
 log
 log "========================"
@@ -87,19 +78,18 @@ touch "$STDOUT_LOG" "$STDERR_LOG"
 
 log
 log "========================"
-log "📡 STREAMING JOB LOGS"
+log "📡 STREAMING LOGS"
 log "========================"
 
 if [ "$VERBOSE" = "true" ]; then
-  log "Verbose mode enabled → full logs"
+  log "mode: verbose"
   tail -n0 -F "$STDOUT_LOG" "$STDERR_LOG" &
 else
-  log "Verbose mode disabled → filtered logs"
-
-    tail -n0 -F "$STDOUT_LOG" "$STDERR_LOG" 2>/dev/null \
-      | grep -vE \
-    'RESOURCE SNAPSHOT|memory\.total|memory\.used|memory\.free|utilization\.gpu|used_gpu_memory|^Mem:|^Swap:|^pid, process_name|^index, name|^==> .* <==$|[0-9]+(\.[0-9]+)?it/s|step=[0-9]+|epoch=[0-9]+|loss=' \
-      || true &
+  log "mode: filtered"
+  tail -n0 -F "$STDOUT_LOG" "$STDERR_LOG" 2>/dev/null \
+    | grep -vE \
+      'RESOURCE SNAPSHOT|memory\.total|memory\.used|memory\.free|utilization\.gpu|used_gpu_memory|^Mem:|^Swap:|^pid, process_name|^index, name|^==> .* <==$|[0-9]+(\.[0-9]+)?it/s|step=[0-9]+|epoch=[0-9]+|loss=' \
+    || true &
 fi
 
 TAIL_PID=$!
@@ -107,14 +97,10 @@ TAIL_PID=$!
 cleanup() {
   kill "$TAIL_PID" 2>/dev/null || true
 }
-
 trap cleanup EXIT INT TERM
 
-# Attendre la fin du job Slurm
-POLL_INTERVAL=2
-
 while squeue -j "$JOB_ID" -h | grep -q .; do
-  sleep "$POLL_INTERVAL"
+  sleep 2
 done
 
 kill "$TAIL_PID" 2>/dev/null || true
@@ -125,27 +111,26 @@ log "========================"
 log "🏁 JOB FINISHED"
 log "========================"
 
-log "--- Last lines of stdout ---"
+log "--- stdout (last 30 lines) ---"
 tail -n 30 "$STDOUT_LOG" || true
 
 log
-log "--- Last lines of stderr ---"
+log "--- stderr (last 30 lines) ---"
 tail -n 30 "$STDERR_LOG" || true
 
-log
-
-FINAL_STATE=$(
+FINAL_STATE="$(
   sacct -j "$JOB_ID" --format=State --noheader 2>/dev/null \
     | awk 'NF {print $1; exit}'
-)
+)"
 
-EXIT_CODE=$(
+EXIT_CODE="$(
   sacct -j "$JOB_ID" --format=ExitCode --noheader 2>/dev/null \
     | awk 'NF {print $1; exit}'
-)
+)"
 
-log "Final state: ${FINAL_STATE:-unknown}"
-log "Exit code  : ${EXIT_CODE:-unknown}"
+log
+log "final state : ${FINAL_STATE:-unknown}"
+log "exit code   : ${EXIT_CODE:-unknown}"
 
 case "${FINAL_STATE:-}" in
   COMPLETED)
