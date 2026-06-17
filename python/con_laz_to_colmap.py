@@ -527,20 +527,31 @@ def build_transforms_json(path: Path, frames, applied_transform=None, applied_sc
         data["applied_scale"] = float(applied_scale)
 
     for fr in frames:
-        T_c2w = np.eye(4, dtype=np.float64)
-        T_c2w[:3, :3] = fr["R_cw"].T
-        T_c2w[:3, 3] = fr["center"]
+        R_cw = np.asarray(fr["R_cw"], dtype=np.float64)
+        t_cw = np.asarray(fr["tvec"], dtype=np.float64).reshape(3, 1)
 
+        # Construire w2c comme dans COLMAP
+        w2c = np.concatenate([R_cw, t_cw], axis=1)
+        w2c = np.concatenate([w2c, np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float64)], axis=0)
+
+        # Inverser pour obtenir c2w
+        c2w = np.linalg.inv(w2c)
+
+        # Conversion repère caméra OpenCV -> OpenGL (comme nerfstudio.colmap_to_json)
+        c2w[0:3, 1:3] *= -1
+
+        # Conversion repère monde vers repère Nerfstudio
         if applied_transform_4x4 is not None:
-            T_c2w = applied_transform_4x4 @ T_c2w
+            c2w = applied_transform_4x4 @ c2w
 
+        # Application éventuelle d'un scale global sur les translations
         if applied_scale is not None:
-            T_c2w = T_c2w.copy()
-            T_c2w[:3, 3] *= float(applied_scale)
+            c2w = c2w.copy()
+            c2w[:3, 3] *= float(applied_scale)
 
         data["frames"].append({
             "file_path": f'./images/{fr["frame_name"]}',
-            "transform_matrix": T_c2w.tolist(),
+            "transform_matrix": c2w.tolist(),
             "colmap_im_id": fr["image_id"],
         })
 
