@@ -67,6 +67,14 @@ def read_laz_points(laz_path: Path, stride: int):
 
     return xyz, rgb
 
+def get_nerfstudio_axis_transform_4x4():
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :4] = np.array([
+        [1.0,  0.0,  0.0, 0.0],
+        [0.0,  0.0,  1.0, 0.0],
+        [0.0, -1.0,  0.0, 0.0],
+    ], dtype=np.float64)
+    return T
 
 def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None):
     n = len(xyz)
@@ -471,26 +479,6 @@ def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None, tracks_by_point=None):
                 parts.append(str(tr["point2d_idx"]))
 
             f.write(" ".join(parts) + "\n")
-
-
-def compute_similarity_transform_from_pose_centers(centers: np.ndarray):
-    if len(centers) == 0:
-        T = np.eye(4, dtype=np.float64)
-        s = 1.0
-        return T, s
-
-    centroid = centers.mean(axis=0)
-    centered = centers - centroid
-    radii = np.linalg.norm(centered, axis=1)
-    max_radius = float(np.max(radii)) if len(radii) > 0 else 1.0
-    if max_radius < 1e-12:
-        max_radius = 1.0
-
-    T = np.eye(4, dtype=np.float64)
-    T[:3, 3] = -centroid
-    s = 1.0 / max_radius
-
-    return T, s
 
 
 def apply_transform_to_points(xyz: np.ndarray, T4: np.ndarray, scale: float):
@@ -1009,7 +997,8 @@ def main():
 
     log("[6/8] Calcul de la normalisation Nerfstudio (transforms + PLY uniquement)...", 1, args.verbose)
     centers = np.stack([fr["center"] for fr in frames], axis=0)
-    applied_transform, applied_scale = compute_similarity_transform_from_pose_centers(centers)
+    applied_transform = get_nerfstudio_axis_transform_4x4()
+    applied_scale = 1.0
 
     log(f"  applied_scale = {applied_scale:.12f}", 1, args.verbose)
     log(f"  applied_transform =\n{applied_transform}", 1, args.verbose)
