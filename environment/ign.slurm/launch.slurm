@@ -28,9 +28,8 @@ VERBOSE="${VERBOSE:-false}"
 #   IMAGE_DIR
 
 # =========================
-# SRUN / SLURM SETTINGS
+# ENV SETTINGS
 # =========================
-export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-8}"
 export NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
 export PYTHONUNBUFFERED=1
@@ -183,7 +182,6 @@ echo "SLURM_JOB_ID=${SLURM_JOB_ID:-<unset>}"
 echo "SLURM_NTASKS=${SLURM_NTASKS:-<unset>}"
 echo "SLURM_NTASKS_PER_NODE=${SLURM_NTASKS_PER_NODE:-<unset>}"
 echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-<unset>}"
-echo "SRUN_CPUS_PER_TASK=${SRUN_CPUS_PER_TASK:-<unset>}"
 
 # =========================
 # OPTIONAL BACKGROUND MONITOR
@@ -219,9 +217,7 @@ fi
 # =========================
 # RUN TRAINING
 # =========================
-srun --unbuffered -v \
-  --ntasks=1 \
-  --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}" \
+srun --unbuffered \
   bash run.sh \
   --root "$ROOTDIR" \
   --name "$BASENAME" \
