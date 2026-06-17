@@ -12,7 +12,13 @@
 #SBATCH -e /mnt/common/hdd/slurm/logs/gsplat-%j.err
 
 set -euo pipefail
-# set -x
+
+
+unset SRUN_CPUS_PER_TASK
+unset SLURM_NTASKS
+unset SLURM_NPROCS
+unset SLURM_TASKS_PER_NODE
+unset SLURM_CPUS_PER_TASK
 
 # =========================
 # LOAD USER CONFIG
@@ -72,8 +78,9 @@ if [ -z "$CONDA_BASE" ]; then
 fi
 
 source "$CONDA_BASE/etc/profile.d/conda.sh"
+set +u
 conda activate gsplat
-
+set -u
 # =========================
 # INPUT VALIDATION
 # =========================
