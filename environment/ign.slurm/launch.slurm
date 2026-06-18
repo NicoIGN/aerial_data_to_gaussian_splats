@@ -237,7 +237,7 @@ srun --unbuffered \
   --colmap-dir "$COLMAP_DIR" \
   --image-dir "$IMAGE_DIR" \
   --skip-conda \
-  --skip-training \
+  ${SKIP_TRAINING:+--skip-training} \
   --gsplat-profile "$GSPLAT_PROFILE"
 
 echo "✅ Job complete"
