@@ -43,11 +43,9 @@ DENSIFY_GRAD_THRESH=1000000000
 # Très permissif : on évite de tuer les GS trop vite
 CULL_ALPHA_THRESH=0.0000001
 
-# Désactive pratiquement le culling par taille écran
-CULL_SCREEN_SIZE=1000000
+CULL_SCREEN_SIZE=0.15
 
-# Désactive pratiquement le culling par échelle
-CULL_SCALE_THRESH=1000000
+CULL_SCALE_THRESH=0.5
 
 ########################################
 # DENSIFICATION CONTROL
