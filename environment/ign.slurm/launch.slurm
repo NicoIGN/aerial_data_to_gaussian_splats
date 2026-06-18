@@ -57,6 +57,11 @@ export MAX_JOBS="${MAX_JOBS:-}"
 export MPLCONFIGDIR="$HOME_SLURM/.config/matplotlib"
 mkdir -p "$MPLCONFIGDIR"
 
+
+export XDG_RUNTIME_DIR="$HOME_SLURM/.runtime"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
 # =========================
 # PROJECT
 # =========================
@@ -81,6 +86,7 @@ source "$CONDA_BASE/etc/profile.d/conda.sh"
 set +u
 conda activate gsplat
 set -u
+
 # =========================
 # INPUT VALIDATION
 # =========================

@@ -160,6 +160,7 @@ echo "⚙️ DEVICE                   : $DEVICE"
 echo "⚙️ MIXED PRECISION          : $MIXED_PRECISION"
 echo "⚙️ USE GRAD SCALER          : $USE_GRAD_SCALER"
 echo "⚙️ USE DEFAULTS             : $USE_DEFAULTS"
+echo "⚙️ RELOAD FROM CHECKPOINT   : $RELOAD_FROM_CHECKPOINT"
 
 echo "🔁 MAX ITERATIONS           : $MAX_ITER"
 echo "🔁 MAX JOBS                 : $MAX_JOBS"
@@ -265,8 +266,9 @@ if [[ -d "$BASE_DIR" ]]; then
   fi
 fi
 
-# disable resume
-LOAD_DIR=""
+if [[ -z "${RELOAD_FROM_CHECKPOINT:-}" || "${RELOAD_FROM_CHECKPOINT}" =~ ^(false|False|FALSE|0|off|OFF|no|NO)$ ]]; then
+    LOAD_DIR=""
+fi
 
 # ======================
 # RUN TIMESTAMP

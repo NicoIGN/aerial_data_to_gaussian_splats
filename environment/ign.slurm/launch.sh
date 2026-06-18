@@ -10,7 +10,7 @@ VERBOSE="${VERBOSE:-false}"
 
 LAUNCH_SLURM="$GIT_ROOT/environment/ign.slurm/launch.slurm"
 RUN_SH="$GIT_ROOT/run.sh"
-CONFIG_SH="./config.sh"
+export CONFIG_SH="${CONFIG_SH:-./config.sh}"
 
 LOG_DIR="/mnt/common/hdd/slurm/logs"
 SUBMIT_LOG="$LOG_DIR/submit.log"
