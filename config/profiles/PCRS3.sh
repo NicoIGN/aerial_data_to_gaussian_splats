@@ -23,8 +23,7 @@ SKIP_IMAGE_PROCESSING=true
 # TRAINING
 ########################################
 
-# Run court de diagnostic
-MAX_ITER=10000
+MAX_ITER=6000
 
 # Pas de split
 STOP_SPLIT_AT=0

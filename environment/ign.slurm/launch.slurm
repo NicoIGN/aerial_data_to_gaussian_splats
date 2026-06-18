@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=16G
-#SBATCH --time=08:00:00
+#SBATCH --time=48:00:00
 #SBATCH --partition=jean-zellou
 #SBATCH -o /mnt/common/hdd/slurm/logs/gsplat-%j.out
 #SBATCH -e /mnt/common/hdd/slurm/logs/gsplat-%j.err
