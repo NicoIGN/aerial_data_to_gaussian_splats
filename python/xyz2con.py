@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+import numpy as np
+
 try:
     from scipy.spatial.transform import Rotation as R
 except ImportError:
@@ -52,12 +54,102 @@ def parse_xyz(xyz_path: Path):
     return rows
 
 
-def build_rotation_matrix(omega_deg: float, phi_deg: float, kappa_deg: float, order: str):
-    return R.from_euler(order, [omega_deg, phi_deg, kappa_deg], degrees=True).as_matrix()
-
-
 def fmt_float(v: float, digits: int = 12):
     return f"{v:.{digits}f}"
+
+
+def rotation_z_deg(angle_deg: float):
+    a = np.deg2rad(angle_deg)
+    c = np.cos(a)
+    s = np.sin(a)
+    return np.array([
+        [c, -s, 0.0],
+        [s,  c, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+
+
+def get_convention_matrix(name: str):
+    name = (name or "none").lower()
+
+    if name == "none":
+        return np.eye(3, dtype=np.float64)
+
+    if name == "swap_xy_cw90":
+        return np.array([
+            [0.0,  1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0,  0.0, 1.0],
+        ], dtype=np.float64)
+
+    if name == "swap_xy_ccw90":
+        return np.array([
+            [0.0, -1.0, 0.0],
+            [1.0,  0.0, 0.0],
+            [0.0,  0.0, 1.0],
+        ], dtype=np.float64)
+
+    if name == "flip_y":
+        return np.array([
+            [1.0,  0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0,  0.0, 1.0],
+        ], dtype=np.float64)
+
+    if name == "flip_x":
+        return np.array([
+            [-1.0, 0.0, 0.0],
+            [0.0,  1.0, 0.0],
+            [0.0,  0.0, 1.0],
+        ], dtype=np.float64)
+
+    raise ValueError(f"Convention inconnue: {name}")
+
+
+def build_rotation_matrix_photogrammetry(
+    omega_deg: float,
+    phi_deg: float,
+    kappa_deg: float,
+    *,
+    euler_order: str = "xyz",
+    kappa_offset_deg: float = -90.0,
+    convention: str = "none",
+    convention_side: str = "right",
+    transpose: bool = False,
+):
+    """
+    Hypothèse pratique:
+    - OPK lu comme une rotation Euler de base
+    - correction fixe par offset sur kappa
+    - éventuelle matrice fixe de convention image/caméra
+    """
+
+    base = R.from_euler(
+        euler_order,
+        [omega_deg, phi_deg, kappa_deg + kappa_offset_deg],
+        degrees=True,
+    ).as_matrix()
+
+    conv = get_convention_matrix(convention)
+
+    if convention_side == "right":
+        M = base @ conv
+    elif convention_side == "left":
+        M = conv @ base
+    else:
+        raise ValueError(f"convention_side invalide: {convention_side}")
+
+    if transpose:
+        M = M.T
+
+    det = np.linalg.det(M)
+    if det < 0:
+        raise ValueError(
+            f"Matrice de rotation invalide (det<0). "
+            f"Vérifie la convention choisie. det={det}"
+        )
+
+    return M
 
 
 def write_con_file(
@@ -66,7 +158,7 @@ def write_con_file(
     X0: float,
     Y0: float,
     Z0: float,
-    M,
+    M: np.ndarray,
     width: int,
     height: int,
     focal: float,
@@ -76,6 +168,7 @@ def write_con_file(
     euclidien_type: str,
     sensor_name: str,
     pixel_size: float | None,
+    image2ground: bool,
 ):
     root = ET.Element("orientation")
 
@@ -112,7 +205,7 @@ def write_con_file(
     ET.SubElement(sommet, "altitude").text = fmt_float(Z0)
 
     rotation = ET.SubElement(extr, "rotation")
-    ET.SubElement(rotation, "Image2Ground").text = "false"
+    ET.SubElement(rotation, "Image2Ground").text = "true" if image2ground else "false"
 
     mat3d = ET.SubElement(rotation, "mat3d")
     for row_name, row in zip(("l1", "l2", "l3"), M):
@@ -157,7 +250,7 @@ def write_con_file(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Convertit un fichier .xyz en fichiers .CON (un par image)."
+        description="Convertit un fichier .xyz photogrammétrique OPK en fichiers .CON (un par image)."
     )
     ap.add_argument("--xyz", required=True, help="Fichier .xyz d'entrée")
     ap.add_argument("--out-dir", required=True, help="Dossier de sortie des fichiers .CON")
@@ -176,11 +269,25 @@ def main():
     ap.add_argument("--geodesique", default="LAMBERT93", help="Nom du système géodésique")
     ap.add_argument("--euclidien-type", default="MATISRTL", help="Type de la balise euclidien")
     ap.add_argument("--sensor-name", default="DRONE_CAMERA", help="Nom du capteur")
+
     ap.add_argument("--euler-order", default="xyz",
                     choices=["xyz", "xzy", "yxz", "yzx", "zxy", "zyx"],
-                    help="Ordre Euler utilisé pour omega, phi, kappa")
+                    help="Ordre Euler utilisé comme base pour omega, phi, kappa")
+    ap.add_argument("--kappa-offset", type=float, default=-90.0,
+                    help="Offset ajouté à kappa en degrés. Par défaut: -90")
+    ap.add_argument("--convention", default="none",
+                    choices=["none", "swap_xy_cw90", "swap_xy_ccw90", "flip_y", "flip_x"],
+                    help="Matrice fixe de convention image/caméra à appliquer")
+    ap.add_argument("--convention-side", default="right",
+                    choices=["left", "right"],
+                    help="Applique la convention à gauche ou à droite de la rotation de base")
     ap.add_argument("--transpose", action="store_true",
-                    help="Transpose la matrice finale avant écriture si nécessaire")
+                    help="Transpose la matrice finale avant écriture")
+    ap.add_argument("--image2ground", action="store_true",
+                    help="Écrit Image2Ground=true dans le XML")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Affiche les paramètres de rotation calculés")
+
     args = ap.parse_args()
 
     xyz_path = Path(args.xyz)
@@ -197,19 +304,30 @@ def main():
         stem = Path(image_name).stem
         out_path = out_dir / f"{stem}.CON"
 
-        M = build_rotation_matrix(
-            row["omega_deg"],
-            row["phi_deg"],
-            row["kappa_deg"],
-            args.euler_order,
+        M = build_rotation_matrix_photogrammetry(
+            omega_deg=row["omega_deg"],
+            phi_deg=row["phi_deg"],
+            kappa_deg=row["kappa_deg"],
+            euler_order=args.euler_order,
+            kappa_offset_deg=args.kappa_offset,
+            convention=args.convention,
+            convention_side=args.convention_side,
+            transpose=args.transpose,
         )
-
-        if args.transpose:
-            M = M.T
 
         focal = args.focal if args.focal is not None else row["c"]
         ppa_c = args.ppa_c if args.ppa_c is not None else (args.width / 2.0)
         ppa_l = args.ppa_l if args.ppa_l is not None else (args.height / 2.0)
+
+        if args.verbose:
+            print(
+                f"{stem}: "
+                f"omega={row['omega_deg']:.6f} "
+                f"phi={row['phi_deg']:.6f} "
+                f"kappa={row['kappa_deg']:.6f} "
+                f"kappa_offset={args.kappa_offset:.6f}"
+            )
+            print(M)
 
         write_con_file(
             out_path=out_path,
@@ -227,6 +345,7 @@ def main():
             euclidien_type=args.euclidien_type,
             sensor_name=args.sensor_name,
             pixel_size=args.pixel_size,
+            image2ground=args.image2ground,
         )
 
     print(f"{len(rows)} fichier(s) .CON généré(s) dans {out_dir}")
