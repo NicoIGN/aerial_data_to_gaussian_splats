@@ -67,6 +67,27 @@ def read_laz_points(laz_path: Path, stride: int):
 
     return xyz, rgb
 
+
+def filter_xy_bbox(xyz: np.ndarray, rgb: np.ndarray | None, xmin=None, xmax=None, ymin=None, ymax=None):
+    if xmin is None and xmax is None and ymin is None and ymax is None:
+        return xyz, rgb
+
+    mask = np.ones(len(xyz), dtype=bool)
+
+    if xmin is not None:
+        mask &= xyz[:, 0] >= float(xmin)
+    if xmax is not None:
+        mask &= xyz[:, 0] <= float(xmax)
+    if ymin is not None:
+        mask &= xyz[:, 1] >= float(ymin)
+    if ymax is not None:
+        mask &= xyz[:, 1] <= float(ymax)
+
+    xyz2 = xyz[mask]
+    rgb2 = None if rgb is None else rgb[mask]
+    return xyz2, rgb2
+
+
 def get_nerfstudio_axis_transform_4x4():
     T = np.eye(4, dtype=np.float64)
     T[:3, :4] = np.array([
@@ -75,6 +96,7 @@ def get_nerfstudio_axis_transform_4x4():
         [0.0, -1.0,  0.0, 0.0],
     ], dtype=np.float64)
     return T
+
 
 def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None):
     n = len(xyz)
@@ -338,8 +360,12 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
     observations_by_image = {fr["image_id"]: [] for fr in frames}
     tracks_by_point = [[] for _ in range(num_pts_total)]
 
+    selected_count = len(selected_indices)
+    pct = 100.0 * selected_count / num_pts_total if num_pts_total > 0 else 0.0
+
     log(
-        f"  Reprojection de {len(selected_indices)} point(s) terrain dans {len(frames)} image(s)...",
+        f"  Reprojection de {selected_count} point(s) terrain sur {num_pts_total} disponible(s) "
+        f"({pct:.2f}%) vers {len(frames)} image(s)...",
         1,
         verbose,
     )
@@ -410,6 +436,47 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
     )
 
     return observations_by_image, tracks_by_point
+
+
+def filter_frames_with_observations(frames, observations_by_image, verbose=1):
+    kept_frames = []
+    old_to_new_image_id = {}
+
+    for fr in frames:
+        old_id = fr["image_id"]
+        obs = observations_by_image.get(old_id, [])
+        if len(obs) == 0:
+            continue
+
+        new_fr = dict(fr)
+        new_id = len(kept_frames) + 1
+        new_fr["image_id"] = new_id
+        kept_frames.append(new_fr)
+        old_to_new_image_id[old_id] = new_id
+
+    observations_new = {}
+    for old_id, new_id in old_to_new_image_id.items():
+        obs_list = observations_by_image.get(old_id, [])
+        observations_new[new_id] = [dict(o) for o in obs_list]
+
+    log(f"  Images conservées après filtrage par observations: {len(kept_frames)}/{len(frames)}", 1, verbose)
+    return kept_frames, observations_new, old_to_new_image_id
+
+
+def remap_tracks_image_ids(tracks_by_point, old_to_new_image_id):
+    remapped = []
+    for track in tracks_by_point:
+        new_track = []
+        for tr in track:
+            old_image_id = tr["image_id"]
+            if old_image_id in old_to_new_image_id:
+                new_track.append({
+                    "image_id": int(old_to_new_image_id[old_image_id]),
+                    "point2d_idx": int(tr["point2d_idx"]),
+                })
+        new_track.sort(key=lambda x: (x["image_id"], x["point2d_idx"]))
+        remapped.append(new_track)
+    return remapped
 
 
 def write_cameras_txt_single_camera(path: Path, width: int, height: int, fx: float, fy: float, cx: float, cy: float):
@@ -530,21 +597,16 @@ def build_transforms_json(path: Path, frames, applied_transform=None, applied_sc
         R_cw = np.asarray(fr["R_cw"], dtype=np.float64)
         t_cw = np.asarray(fr["tvec"], dtype=np.float64).reshape(3, 1)
 
-        # Construire w2c comme dans COLMAP
         w2c = np.concatenate([R_cw, t_cw], axis=1)
         w2c = np.concatenate([w2c, np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float64)], axis=0)
 
-        # Inverser pour obtenir c2w
         c2w = np.linalg.inv(w2c)
 
-        # Conversion repère caméra OpenCV -> OpenGL (comme nerfstudio.colmap_to_json)
         c2w[0:3, 1:3] *= -1
 
-        # Conversion repère monde vers repère Nerfstudio
         if applied_transform_4x4 is not None:
             c2w = applied_transform_4x4 @ c2w
 
-        # Application éventuelle d'un scale global sur les translations
         if applied_scale is not None:
             c2w = c2w.copy()
             c2w[:3, 3] *= float(applied_scale)
@@ -741,16 +803,10 @@ def validate_colmap_text_model(images_txt: Path, points3d_txt: Path, verbose: in
     warnings = []
 
     image_obs_lookup = {}
-    referenced_point_ids_from_images = set()
 
     for image_id, im in images.items():
         obs = im["observations"]
         image_obs_lookup[image_id] = obs
-
-        for o in obs:
-            pid = o["point3d_id"]
-            if pid != -1:
-                referenced_point_ids_from_images.add(pid)
 
     for point3d_id, pdata in points.items():
         track = pdata["track"]
@@ -843,12 +899,16 @@ def main():
     ap.add_argument("--laz", required=True, help="Fichier .LAZ")
     ap.add_argument("--images", required=True, help="Dossier des images source")
     ap.add_argument("--out", required=True, help="Dossier de sortie")
-    ap.add_argument("--subsample", type=int, default=10, help="Facteur de sous-échantillonnage du LAZ")
+    ap.add_argument("--subsample", type=int, default=10, help="Facteur de sous-échantillonnage initial du LAZ")
     ap.add_argument("--image-factor", type=float, default=1.0,
                     help="Facteur de sous-échantillonnage des images (2 = largeur/hauteur divisées par 2)")
     ap.add_argument("--jpeg-quality", type=int, default=95, help="Qualité JPEG de sortie")
     ap.add_argument("--num-terrain-points", type=int, default=5000,
                     help="Nombre de points terrain à reprojeter dans toutes les images")
+    ap.add_argument("--xmin", type=float, default=None, help="Borne minimale X optionnelle pour filtrer le LAZ")
+    ap.add_argument("--xmax", type=float, default=None, help="Borne maximale X optionnelle pour filtrer le LAZ")
+    ap.add_argument("--ymin", type=float, default=None, help="Borne minimale Y optionnelle pour filtrer le LAZ")
+    ap.add_argument("--ymax", type=float, default=None, help="Borne maximale Y optionnelle pour filtrer le LAZ")
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                     help="0=silencieux, 1=info, 2=warn+info")
     args = ap.parse_args()
@@ -986,7 +1046,22 @@ def main():
 
     log("[4/8] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
     pts_xyz_raw, pts_rgb = read_laz_points(laz_path, args.subsample)
-    log(f"  {len(pts_xyz_raw)} points conservés.", 1, args.verbose)
+    log(f"  {len(pts_xyz_raw)} points conservés après sous-échantillonnage initial.", 1, args.verbose)
+
+    bbox_enabled = any(v is not None for v in (args.xmin, args.xmax, args.ymin, args.ymax))
+    if bbox_enabled:
+        log("[4b/8] Filtrage du LAZ par bbox XY...", 1, args.verbose)
+        before_bbox = len(pts_xyz_raw)
+        pts_xyz_raw, pts_rgb = filter_xy_bbox(
+            pts_xyz_raw, pts_rgb,
+            xmin=args.xmin, xmax=args.xmax,
+            ymin=args.ymin, ymax=args.ymax,
+        )
+        log(f"  {len(pts_xyz_raw)}/{before_bbox} points conservés dans la bbox.", 1, args.verbose)
+
+    if len(pts_xyz_raw) == 0:
+        print("Aucun point LAZ conservé après filtrage.")
+        sys.exit(4)
 
     log("[5/8] Génération des observations synthétiques (repère COLMAP source)...", 1, args.verbose)
     observations_by_image, tracks_by_point = build_synthetic_observations(
@@ -997,6 +1072,17 @@ def main():
         verbose=args.verbose,
     )
 
+    if bbox_enabled:
+        log("[5b/8] Filtrage des images n'ayant aucune observation dans la bbox...", 1, args.verbose)
+        frames, observations_by_image, old_to_new_image_id = filter_frames_with_observations(
+            frames, observations_by_image, verbose=args.verbose
+        )
+        tracks_by_point = remap_tracks_image_ids(tracks_by_point, old_to_new_image_id)
+
+        if not frames:
+            print("Aucune image ne possède de point homologue dans la bbox.")
+            sys.exit(5)
+
     pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_by_image = filter_points_with_tracks(
         pts_xyz=pts_xyz_raw,
         pts_rgb=pts_rgb,
@@ -1005,6 +1091,10 @@ def main():
     )
 
     log(f"  Points 3D exportés avec tracks: {len(pts_xyz_kept)}", 1, args.verbose)
+
+    if len(pts_xyz_kept) == 0:
+        print("Aucun point 3D avec track après filtrage.")
+        sys.exit(6)
 
     log("[6/8] Calcul de la normalisation Nerfstudio (transforms + PLY uniquement)...", 1, args.verbose)
     centers = np.stack([fr["center"] for fr in frames], axis=0)
@@ -1023,13 +1113,13 @@ def main():
         centers,
     )
 
-    log(f"[7/8] Écriture cameras.txt, images.txt, points3D.txt + sparse_pc.ply...", 1, args.verbose)
+    log("[7/8] Écriture cameras.txt, images.txt, points3D.txt + sparse_pc.ply...", 1, args.verbose)
     write_cameras_txt_single_camera(out_sparse / "cameras.txt", width, height, fx, fy, cx, cy)
     write_images_txt(out_sparse / "images.txt", frames, observations_by_image)
     write_points3D_txt(out_sparse / "points3D.txt", pts_xyz_kept, pts_rgb_kept, tracks_kept)
     write_ply_xyzrgb(sparse_pc_ply, pts_xyz_kept_ns, pts_rgb_kept)
 
-    log(f"[8/8] Export transforms.json + conversion binaire...", 1, args.verbose)
+    log("[8/8] Export transforms.json + conversion binaire...", 1, args.verbose)
     build_transforms_json(
         out_dir / "transforms.json",
         frames,
