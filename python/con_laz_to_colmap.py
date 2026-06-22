@@ -3,12 +3,22 @@
 
 import argparse
 import json
-import subprocess
+import shutil
 import sys
 from pathlib import Path
 import xml.etree.ElementTree as ET
+import subprocess
+
+
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import numpy as np
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 try:
     import laspy
@@ -127,21 +137,69 @@ def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None)
             )
 
 
-def run_decompression_script(script_path: Path, input_dir: Path, output_dir: Path,
-                             factor: float, jpeg_quality: int, verbose: int):
-    cmd = [
-        sys.executable,
-        str(script_path),
-        "--input-dir", str(input_dir),
-        "--output-dir", str(output_dir),
-        "--factor", str(factor),
-        "--jpg",
-        "--jpeg-quality", str(jpeg_quality),
-    ]
-    if verbose >= 1:
-        cmd.append("--verbose")
+def prepare_selected_images(source_paths, output_dir: Path, factor: float, jpeg_quality: int,
+                            verbose: int, image_convertor_script: Path):
+    ensure_dir(output_dir)
 
-    subprocess.run(cmd, check=True)
+    if not image_convertor_script.exists():
+        raise FileNotFoundError(f"Script de conversion introuvable: {image_convertor_script}")
+
+    produced = {}
+
+    for src_path in source_paths:
+        src_path = Path(src_path)
+        stem = src_path.stem
+        ext = src_path.suffix.lower()
+
+        if ext in {".jp2", ".tif", ".tiff"}:
+            out_path = output_dir / f"{stem}.jpg"
+            output_mode = "--jpg"
+
+        elif ext in {".jpg", ".jpeg", ".png", ".bmp"}:
+            if factor <= 1.0:
+                out_path = output_dir / src_path.name
+                log(f"  Copie: {src_path.name}", 2, verbose)
+                shutil.copy2(src_path, out_path)
+                produced[stem] = out_path
+                continue
+
+            out_path = output_dir / src_path.name
+            if ext in {".jpg", ".jpeg"}:
+                output_mode = "--jpg"
+            elif ext == ".png":
+                output_mode = "--png"
+            elif ext == ".bmp":
+                output_mode = "--png"
+                out_path = output_dir / f"{stem}.png"
+            else:
+                output_mode = "--jpg"
+                out_path = output_dir / f"{stem}.jpg"
+        else:
+            log(f"[WARN] Format non géré ignoré: {src_path.name}", 2, verbose)
+            continue
+
+        cmd = [
+            sys.executable,
+            str(image_convertor_script),
+            "--input", str(src_path),
+            "--output", str(out_path),
+            "--factor", str(factor),
+            output_mode,
+            "--jpeg-quality", str(jpeg_quality),
+        ]
+
+        if verbose >= 1:
+            cmd.append("--verbose")
+
+        log(f"  Conversion: {src_path.name} -> {out_path.name}", 2, verbose)
+        subprocess.run(cmd, check=True)
+
+        if not out_path.exists():
+            raise FileNotFoundError(f"Image convertie introuvable après conversion: {out_path}")
+
+        produced[stem] = out_path
+
+    return produced
 
 
 def apply_cylindrical_systematism_local_to_image(c, l, transfo2d):
@@ -370,7 +428,17 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
         verbose,
     )
 
-    for local_count, pt_idx in enumerate(selected_indices, start=1):
+    iterable = selected_indices
+    use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
+    if use_tqdm:
+        iterable = tqdm(
+            selected_indices,
+            total=len(selected_indices),
+            desc="Reprojection points terrain",
+            unit="pt",
+        )
+
+    for local_count, pt_idx in enumerate(iterable, start=1):
         xyz = pts_xyz[pt_idx]
         point3d_id = int(pt_idx + 1)
 
@@ -410,7 +478,7 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
                 "point2d_idx": int(point2d_idx),
             })
 
-        if local_count % 1000 == 0:
+        if not use_tqdm and local_count % 1000 == 0:
             log(
                 f"  {local_count}/{len(selected_indices)} points terrain reprojetés...",
                 1,
@@ -438,7 +506,38 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
     return observations_by_image, tracks_by_point
 
 
-def filter_frames_with_observations(frames, observations_by_image, verbose=1):
+def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by_image):
+    kept_old_indices = [i for i, tr in enumerate(tracks_by_point) if len(tr) > 0]
+
+    if len(kept_old_indices) == 0:
+        pts_xyz_kept = pts_xyz[:0].copy()
+        pts_rgb_kept = None if pts_rgb is None else pts_rgb[:0].copy()
+        tracks_kept = []
+        observations_new = {k: [] for k in observations_by_image}
+        old_to_new_point_id = {}
+        return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new, old_to_new_point_id
+
+    old_to_new_point_id = {old_idx + 1: new_id for new_id, old_idx in enumerate(kept_old_indices, start=1)}
+
+    pts_xyz_kept = pts_xyz[kept_old_indices]
+    pts_rgb_kept = None if pts_rgb is None else pts_rgb[kept_old_indices]
+    tracks_kept = [tracks_by_point[i] for i in kept_old_indices]
+
+    observations_new = {}
+    for image_id, obs_list in observations_by_image.items():
+        new_obs_list = []
+        for obs in obs_list:
+            old_pid = obs["point3d_id"]
+            if old_pid in old_to_new_point_id:
+                new_obs = dict(obs)
+                new_obs["point3d_id"] = old_to_new_point_id[old_pid]
+                new_obs_list.append(new_obs)
+        observations_new[image_id] = new_obs_list
+
+    return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new, old_to_new_point_id
+
+
+def filter_frames_with_observations_and_remap(frames, observations_by_image, tracks_by_point, verbose=1):
     kept_frames = []
     old_to_new_image_id = {}
 
@@ -454,29 +553,31 @@ def filter_frames_with_observations(frames, observations_by_image, verbose=1):
         kept_frames.append(new_fr)
         old_to_new_image_id[old_id] = new_id
 
-    observations_new = {}
+    new_observations_by_image = {}
     for old_id, new_id in old_to_new_image_id.items():
         obs_list = observations_by_image.get(old_id, [])
-        observations_new[new_id] = [dict(o) for o in obs_list]
+        new_observations_by_image[new_id] = [dict(o) for o in obs_list]
 
-    log(f"  Images conservées après filtrage par observations: {len(kept_frames)}/{len(frames)}", 1, verbose)
-    return kept_frames, observations_new, old_to_new_image_id
-
-
-def remap_tracks_image_ids(tracks_by_point, old_to_new_image_id):
-    remapped = []
+    new_tracks_by_point = []
     for track in tracks_by_point:
-        new_track = []
+        remapped_track = []
         for tr in track:
             old_image_id = tr["image_id"]
             if old_image_id in old_to_new_image_id:
-                new_track.append({
+                remapped_track.append({
                     "image_id": int(old_to_new_image_id[old_image_id]),
                     "point2d_idx": int(tr["point2d_idx"]),
                 })
-        new_track.sort(key=lambda x: (x["image_id"], x["point2d_idx"]))
-        remapped.append(new_track)
-    return remapped
+        remapped_track.sort(key=lambda x: (x["image_id"], x["point2d_idx"]))
+        new_tracks_by_point.append(remapped_track)
+
+    log(
+        f"  Images conservées après filtrage par observations: {len(kept_frames)}/{len(frames)}",
+        1,
+        verbose,
+    )
+
+    return kept_frames, new_observations_by_image, new_tracks_by_point, old_to_new_image_id
 
 
 def write_cameras_txt_single_camera(path: Path, width: int, height: int, fx: float, fy: float, cx: float, cy: float):
@@ -601,7 +702,6 @@ def build_transforms_json(path: Path, frames, applied_transform=None, applied_sc
         w2c = np.concatenate([w2c, np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float64)], axis=0)
 
         c2w = np.linalg.inv(w2c)
-
         c2w[0:3, 1:3] *= -1
 
         if applied_transform_4x4 is not None:
@@ -729,36 +829,6 @@ def parse_points3d_txt_for_validation(path: Path):
     return points
 
 
-def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by_image):
-    kept_old_indices = [i for i, tr in enumerate(tracks_by_point) if len(tr) > 0]
-
-    if len(kept_old_indices) == 0:
-        pts_xyz_kept = pts_xyz[:0].copy()
-        pts_rgb_kept = None if pts_rgb is None else pts_rgb[:0].copy()
-        tracks_kept = []
-        observations_new = {k: [] for k in observations_by_image}
-        return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new
-
-    old_to_new_id = {old_idx + 1: new_id for new_id, old_idx in enumerate(kept_old_indices, start=1)}
-
-    pts_xyz_kept = pts_xyz[kept_old_indices]
-    pts_rgb_kept = None if pts_rgb is None else pts_rgb[kept_old_indices]
-    tracks_kept = [tracks_by_point[i] for i in kept_old_indices]
-
-    observations_new = {}
-    for image_id, obs_list in observations_by_image.items():
-        new_obs_list = []
-        for obs in obs_list:
-            old_pid = obs["point3d_id"]
-            if old_pid in old_to_new_id:
-                new_obs = dict(obs)
-                new_obs["point3d_id"] = old_to_new_id[old_pid]
-                new_obs_list.append(new_obs)
-        observations_new[image_id] = new_obs_list
-
-    return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new
-
-
 def try_write_colmap_bin(sparse_dir: Path, verbose: int):
     images_txt = sparse_dir / "images.txt"
     points3d_txt = sparse_dir / "points3D.txt"
@@ -803,10 +873,8 @@ def validate_colmap_text_model(images_txt: Path, points3d_txt: Path, verbose: in
     warnings = []
 
     image_obs_lookup = {}
-
     for image_id, im in images.items():
-        obs = im["observations"]
-        image_obs_lookup[image_id] = obs
+        image_obs_lookup[image_id] = im["observations"]
 
     for point3d_id, pdata in points.items():
         track = pdata["track"]
@@ -859,9 +927,7 @@ def validate_colmap_text_model(images_txt: Path, points3d_txt: Path, verbose: in
 
     points_without_track = [pid for pid, pdata in points.items() if len(pdata["track"]) == 0]
     if points_without_track:
-        warnings.append(
-            f"{len(points_without_track)} point(s) 3D sans track"
-        )
+        warnings.append(f"{len(points_without_track)} point(s) 3D sans track")
 
     image_obs_count = sum(len(im["observations"]) for im in images.values())
     tracked_image_obs_count = sum(
@@ -918,10 +984,7 @@ def main():
     out_dir = Path(args.out)
 
     script_dir = Path(__file__).resolve().parent
-    decompression_script = script_dir / "decompress-jp2.py"
-
-    if not decompression_script.exists():
-        raise FileNotFoundError(f"Script introuvable: {decompression_script}")
+    image_convertor_script = script_dir / "image_convertor.py"
 
     out_images = out_dir / "images"
     out_colmap = out_dir / "colmap"
@@ -943,20 +1006,7 @@ def main():
 
     factor = max(float(args.image_factor), 1.0)
 
-    log("[2/8] Décompression + sous-échantillonnage des images...", 1, args.verbose)
-    run_decompression_script(
-        script_path=decompression_script,
-        input_dir=images_dir,
-        output_dir=out_images,
-        factor=factor,
-        jpeg_quality=args.jpeg_quality,
-        verbose=args.verbose,
-    )
-
-    decompressed_index = build_image_index(out_images)
-    log(f"  {len(decompressed_index)} images exportées indexées.", 1, args.verbose)
-
-    log("[3/8] Lecture des fichiers .CON...", 1, args.verbose)
+    log("[2/8] Lecture des fichiers .CON...", 1, args.verbose)
     frames = []
     intrinsics_ref = None
     skipped_no_con = 0
@@ -969,11 +1019,6 @@ def main():
         if not con_path.exists():
             log(f"[WARN] .CON introuvable pour {src_img.name}", 2, args.verbose)
             skipped_no_con += 1
-            continue
-
-        exported_img = decompressed_index.get(stem)
-        if exported_img is None:
-            log(f"[WARN] Image exportée absente après décompression: {stem}", 2, args.verbose)
             continue
 
         try:
@@ -1011,7 +1056,8 @@ def main():
         frames.append({
             "image_id": len(frames) + 1,
             "camera_id": 1,
-            "frame_name": exported_img.name,
+            "frame_name": None,
+            "source_stem": stem,
             "source_image": str(src_img),
             "con_path": str(con_path),
             "center": ori["center"],
@@ -1044,13 +1090,13 @@ def main():
 
     width, height, fx, fy, cx, cy = intrinsics_ref
 
-    log("[4/8] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
+    log("[3/8] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
     pts_xyz_raw, pts_rgb = read_laz_points(laz_path, args.subsample)
     log(f"  {len(pts_xyz_raw)} points conservés après sous-échantillonnage initial.", 1, args.verbose)
 
     bbox_enabled = any(v is not None for v in (args.xmin, args.xmax, args.ymin, args.ymax))
     if bbox_enabled:
-        log("[4b/8] Filtrage du LAZ par bbox XY...", 1, args.verbose)
+        log("[3b/8] Filtrage du LAZ par bbox XY...", 1, args.verbose)
         before_bbox = len(pts_xyz_raw)
         pts_xyz_raw, pts_rgb = filter_xy_bbox(
             pts_xyz_raw, pts_rgb,
@@ -1063,7 +1109,7 @@ def main():
         print("Aucun point LAZ conservé après filtrage.")
         sys.exit(4)
 
-    log("[5/8] Génération des observations synthétiques (repère COLMAP source)...", 1, args.verbose)
+    log("[4/8] Génération des observations synthétiques (repère COLMAP source)...", 1, args.verbose)
     observations_by_image, tracks_by_point = build_synthetic_observations(
         frames=frames,
         pts_xyz=pts_xyz_raw,
@@ -1072,18 +1118,7 @@ def main():
         verbose=args.verbose,
     )
 
-    if bbox_enabled:
-        log("[5b/8] Filtrage des images n'ayant aucune observation dans la bbox...", 1, args.verbose)
-        frames, observations_by_image, old_to_new_image_id = filter_frames_with_observations(
-            frames, observations_by_image, verbose=args.verbose
-        )
-        tracks_by_point = remap_tracks_image_ids(tracks_by_point, old_to_new_image_id)
-
-        if not frames:
-            print("Aucune image ne possède de point homologue dans la bbox.")
-            sys.exit(5)
-
-    pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_by_image = filter_points_with_tracks(
+    pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_by_image, old_to_new_point_id = filter_points_with_tracks(
         pts_xyz=pts_xyz_raw,
         pts_rgb=pts_rgb,
         tracks_by_point=tracks_by_point,
@@ -1094,9 +1129,41 @@ def main():
 
     if len(pts_xyz_kept) == 0:
         print("Aucun point 3D avec track après filtrage.")
+        sys.exit(5)
+
+    log("[5/8] Filtrage des images sans homologue conservé...", 1, args.verbose)
+    frames, observations_by_image, tracks_kept, old_to_new_image_id = filter_frames_with_observations_and_remap(
+        frames=frames,
+        observations_by_image=observations_by_image,
+        tracks_by_point=tracks_kept,
+        verbose=args.verbose,
+    )
+
+    if not frames:
+        print("Aucune image ne possède de point homologue conservé.")
         sys.exit(6)
 
-    log("[6/8] Calcul de la normalisation Nerfstudio (transforms + PLY uniquement)...", 1, args.verbose)
+    log("[6/8] Préparation des images utiles uniquement (conversion / copie / sous-échantillonnage)...", 1, args.verbose)
+    selected_source_paths = [Path(fr["source_image"]) for fr in frames]
+    exported_index = prepare_selected_images(
+        source_paths=selected_source_paths,
+        output_dir=out_images,
+        factor=factor,
+        jpeg_quality=args.jpeg_quality,
+        verbose=args.verbose,
+        image_convertor_script=image_convertor_script,
+    )
+
+    for fr in frames:
+        stem = fr["source_stem"]
+        exported_img = exported_index.get(stem)
+        if exported_img is None:
+            raise RuntimeError(f"Image exportée absente après préparation: {stem}")
+        fr["frame_name"] = exported_img.name
+
+    log(f"  {len(exported_index)} image(s) utile(s) préparée(s).", 1, args.verbose)
+
+    log("[7/8] Calcul de la normalisation Nerfstudio (transforms + PLY uniquement)...", 1, args.verbose)
     centers = np.stack([fr["center"] for fr in frames], axis=0)
     applied_transform = get_nerfstudio_axis_transform_4x4()
     applied_scale = 1.0
@@ -1106,6 +1173,16 @@ def main():
 
     pts_xyz_kept_ns = apply_transform_to_points(pts_xyz_kept, applied_transform, applied_scale)
 
+    if len(pts_xyz_kept) > 0:
+        log(
+            f"  Emprise points exportés: "
+            f"x=[{pts_xyz_kept[:,0].min():.3f}, {pts_xyz_kept[:,0].max():.3f}] "
+            f"y=[{pts_xyz_kept[:,1].min():.3f}, {pts_xyz_kept[:,1].max():.3f}] "
+            f"z=[{pts_xyz_kept[:,2].min():.3f}, {pts_xyz_kept[:,2].max():.3f}]",
+            1,
+            args.verbose,
+        )
+
     write_scene_normalization_json(
         normalization_json,
         applied_transform,
@@ -1113,13 +1190,12 @@ def main():
         centers,
     )
 
-    log("[7/8] Écriture cameras.txt, images.txt, points3D.txt + sparse_pc.ply...", 1, args.verbose)
+    log("[8/8] Écriture COLMAP, sparse_pc.ply, transforms.json + conversion binaire...", 1, args.verbose)
     write_cameras_txt_single_camera(out_sparse / "cameras.txt", width, height, fx, fy, cx, cy)
     write_images_txt(out_sparse / "images.txt", frames, observations_by_image)
     write_points3D_txt(out_sparse / "points3D.txt", pts_xyz_kept, pts_rgb_kept, tracks_kept)
     write_ply_xyzrgb(sparse_pc_ply, pts_xyz_kept_ns, pts_rgb_kept)
 
-    log("[8/8] Export transforms.json + conversion binaire...", 1, args.verbose)
     build_transforms_json(
         out_dir / "transforms.json",
         frames,
@@ -1142,7 +1218,7 @@ def main():
 
     print("\nTerminé.")
     print(f"Sortie: {out_dir}")
-    print(f"Images: {out_images}")
+    print(f"Images utiles: {out_images}")
     print(f"COLMAP sparse: {out_sparse}")
     print(f"Sparse PLY Nerfstudio: {sparse_pc_ply}")
     print(f"Transforms Nerfstudio: {out_dir / 'transforms.json'}")
