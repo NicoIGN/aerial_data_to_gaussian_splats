@@ -1,370 +1,238 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# python xyz2con.py \
+  --input /Users/nbellaiche/DATA/dev/gsplat/dataset/drone/Image_orientations_dataset1.xyz \
+  --images_dir /Users/nbellaiche/DATA/dev/gsplat/dataset/drone/Metashape_outputs_images \
+  --output_dir /Users/nbellaiche/DATA/dev/gsplat/dataset/drone/Metashape_outputs_images \
+  --order RxRyRz \
+  --rot_flip_x \
+  --flip_ppx
+
 import argparse
-import sys
+import math
 from pathlib import Path
+import pandas as pd
 import xml.etree.ElementTree as ET
+from PIL import Image, ExifTags
 
-import numpy as np
+def d2r(v): return v * math.pi / 180.0
 
-try:
-    from scipy.spatial.transform import Rotation as R
-except ImportError:
-    print("Erreur: scipy requis. Installe: pip install scipy")
-    sys.exit(1)
+def Rx(a):
+    ca, sa = math.cos(a), math.sin(a)
+    return [[1,0,0],[0,ca,-sa],[0,sa,ca]]
 
+def Ry(a):
+    ca, sa = math.cos(a), math.sin(a)
+    return [[ca,0,sa],[0,1,0],[-sa,0,ca]]
 
-def parse_xyz(xyz_path: Path):
-    rows = []
+def Rz(a):
+    ca, sa = math.cos(a), math.sin(a)
+    return [[ca,-sa,0],[sa,ca,0],[0,0,1]]
 
-    with open(xyz_path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
-            s = line.strip()
-            if not s:
-                continue
-            if s.startswith("#"):
-                continue
+def mm(A,B):
+    return [[sum(A[i][k]*B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
 
-            parts = s.split()
-            if len(parts) < 15:
-                raise ValueError(
-                    f"{xyz_path}: ligne {line_no} invalide, "
-                    f"attendu au moins 15 colonnes, reçu {len(parts)}"
-                )
+def opk_to_R(omega_deg, phi_deg, kappa_deg, order="RzRyRx"):
+    o,p,k = d2r(omega_deg), d2r(phi_deg), d2r(kappa_deg)
+    if order == "RzRyRx":
+        return mm(mm(Rz(k), Ry(p)), Rx(o))
+    elif order == "RxRyRz":
+        return mm(mm(Rx(o), Ry(p)), Rz(k))
+    raise ValueError("order must be RzRyRx or RxRyRz")
 
-            rows.append({
-                "label": parts[0],
-                "X0": float(parts[1]),
-                "Y0": float(parts[2]),
-                "Z0": float(parts[3]),
-                "omega_deg": float(parts[4]),
-                "phi_deg": float(parts[5]),
-                "kappa_deg": float(parts[6]),
-                "c": float(parts[7]),
-                "x0": float(parts[8]),
-                "y0": float(parts[9]),
-                "a3": float(parts[10]),
-                "a4": float(parts[11]),
-                "a5": float(parts[12]),
-                "a6": float(parts[13]),
-                "rho0": float(parts[14]),
-            })
+def diag3(sx, sy, sz):
+    return [[sx,0,0],[0,sy,0],[0,0,sz]]
 
-    return rows
+def indent(elem, level=0):
+    i = "\n" + level*"    "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "    "
+        for e in elem:
+            indent(e, level+1)
+        if not e.tail or not e.tail.strip():
+            e.tail = i
+    if level and (not elem.tail or not elem.tail.strip()):
+        elem.tail = i
 
+def fmt(v, n=12):
+    return f"{float(v):.{n}f}"
 
-def fmt_float(v: float, digits: int = 12):
-    return f"{v:.{digits}f}"
+def exif_dict(img):
+    out = {}
+    ex = img.getexif()
+    if not ex:
+        return out
+    tagmap = {v:k for k,v in ExifTags.TAGS.items()}
+    for name in ["FocalLengthIn35mmFilm", "FocalLength"]:
+        tid = tagmap.get(name)
+        if tid in ex:
+            out[name] = ex.get(tid)
+    return out
 
+def exif_35mm_to_float(v):
+    if v is None:
+        return None
+    try:
+        if isinstance(v, tuple) and len(v) == 2:
+            return float(v[0]) / float(v[1])
+        return float(v)
+    except Exception:
+        return None
 
-def get_convention_matrix(name: str):
-    name = (name or "none").lower()
+def estimate_focal_px_from_exif(width_px, exif35):
+    if exif35 is None or exif35 <= 0:
+        return None
+    return (exif35 / 36.0) * float(width_px)
 
-    if name == "none":
-        return np.eye(3, dtype=np.float64)
+def build_con(row, width, height, c, l, focale, geodesique, order, rot_flip_x=False, rot_flip_y=False):
+    R = opk_to_R(row["omega[deg]"], row["phi[deg]"], row["kappa[deg]"], order=order)
 
-    if name == "swap_xy_cw90":
-        return np.array([
-            [0.0,  1.0, 0.0],
-            [-1.0, 0.0, 0.0],
-            [0.0,  0.0, 1.0],
-        ], dtype=np.float64)
+    # Flip axes caméra dans la rotation (hypothèses de convention)
+    sx = -1 if rot_flip_x else 1
+    sy = -1 if rot_flip_y else 1
+    F = diag3(sx, sy, 1)
+    R = mm(R, F)
 
-    if name == "swap_xy_ccw90":
-        return np.array([
-            [0.0, -1.0, 0.0],
-            [1.0,  0.0, 0.0],
-            [0.0,  0.0, 1.0],
-        ], dtype=np.float64)
-
-    if name == "flip_y":
-        return np.array([
-            [1.0,  0.0, 0.0],
-            [0.0, -1.0, 0.0],
-            [0.0,  0.0, 1.0],
-        ], dtype=np.float64)
-
-    if name == "flip_x":
-        return np.array([
-            [-1.0, 0.0, 0.0],
-            [0.0,  1.0, 0.0],
-            [0.0,  0.0, 1.0],
-        ], dtype=np.float64)
-
-    if name == "flip_xy":
-        return np.array([
-            [-1.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0],
-            [0.0,  0.0, 1.0],
-        ], dtype=np.float64)
-
-    raise ValueError(f"Convention inconnue: {name}")
-
-
-def build_rotation_matrix_photogrammetry(
-    omega_deg: float,
-    phi_deg: float,
-    kappa_deg: float,
-    *,
-    euler_order: str = "xyz",
-    kappa_offset_deg: float = 0.0,
-    convention: str = "none",
-    convention_side: str = "right",
-    transpose: bool = False,
-):
-    base = R.from_euler(
-        euler_order,
-        [omega_deg, phi_deg, kappa_deg + kappa_offset_deg],
-        degrees=True,
-    ).as_matrix()
-
-    conv = get_convention_matrix(convention)
-
-    if convention_side == "right":
-        M = base @ conv
-    elif convention_side == "left":
-        M = conv @ base
-    else:
-        raise ValueError(f"convention_side invalide: {convention_side}")
-
-    if transpose:
-        M = M.T
-
-    det = np.linalg.det(M)
-    if det < 0:
-        raise ValueError(
-            f"Matrice de rotation invalide (det<0). "
-            f"Vérifie la convention choisie. det={det}"
-        )
-
-    return M
-
-
-def write_con_file(
-    out_path: Path,
-    image_name: str,
-    X0: float,
-    Y0: float,
-    Z0: float,
-    M: np.ndarray,
-    width: int,
-    height: int,
-    focal: float,
-    ppa_c: float,
-    ppa_l: float,
-    geodesique: str,
-    euclidien_type: str,
-    sensor_name: str,
-    pixel_size: float | None,
-    image2ground: bool,
-):
     root = ET.Element("orientation")
-
-    ET.SubElement(root, "lastmodificationbylibori", attrib={
-        "date": "2026-06-22",
-        "time": "00 h 00 min 00 sec"
-    })
+    ET.SubElement(root, "lastmodificationbylibori", {"date":"2026-06-22","time":"00 h 00 min 00 sec"})
     ET.SubElement(root, "version").text = "1.0"
 
-    auxiliarydata = ET.SubElement(root, "auxiliarydata")
-    ET.SubElement(auxiliarydata, "image_name").text = Path(image_name).stem
+    aux = ET.SubElement(root, "auxiliarydata")
+    img_name = Path(str(row["label"])).stem
+    ET.SubElement(aux, "image_name").text = img_name
+    idate = ET.SubElement(aux, "image_date")
+    for t in ["year","month","day","hour","minute","second"]:
+        ET.SubElement(idate, t).text = "0"
+    ET.SubElement(idate, "time_system")
+    ET.SubElement(aux, "samples")
 
-    image_date = ET.SubElement(auxiliarydata, "image_date")
-    for tag in ("year", "month", "day", "hour", "minute", "second"):
-        ET.SubElement(image_date, tag).text = "0"
-    ET.SubElement(image_date, "time_system").text = ""
-    ET.SubElement(auxiliarydata, "samples")
-
-    geometry = ET.SubElement(root, "geometry", attrib={"type": "physique"})
-
-    extr = ET.SubElement(geometry, "extrinseque")
-    systeme = ET.SubElement(extr, "systeme")
-
-    euclidien = ET.SubElement(systeme, "euclidien", attrib={"type": euclidien_type})
-    ET.SubElement(euclidien, "x").text = fmt_float(X0)
-    ET.SubElement(euclidien, "y").text = fmt_float(Y0)
-
+    geom = ET.SubElement(root, "geometry", {"type":"physique"})
+    ext = ET.SubElement(geom, "extrinseque")
+    systeme = ET.SubElement(ext, "systeme")
+    euc = ET.SubElement(systeme, "euclidien", {"type":"MATISRTL"})
+    ET.SubElement(euc, "x").text = fmt(row["X0"], 12)
+    ET.SubElement(euc, "y").text = fmt(row["Y0"], 12)
     ET.SubElement(systeme, "geodesique").text = geodesique
-    ET.SubElement(extr, "grid_alti").text = "UNKNOWN"
+    ET.SubElement(ext, "grid_alti").text = "UNKNOWN"
 
-    sommet = ET.SubElement(extr, "sommet")
+    sommet = ET.SubElement(ext, "sommet")
     ET.SubElement(sommet, "easting").text = "0"
     ET.SubElement(sommet, "northing").text = "0"
-    ET.SubElement(sommet, "altitude").text = fmt_float(Z0)
+    ET.SubElement(sommet, "altitude").text = fmt(row["Z0"], 12)
 
-    rotation = ET.SubElement(extr, "rotation")
-    ET.SubElement(rotation, "Image2Ground").text = "true" if image2ground else "false"
+    rot = ET.SubElement(ext, "rotation")
+    ET.SubElement(rot, "Image2Ground").text = "true"
+    mat3d = ET.SubElement(rot, "mat3d")
+    for i in range(3):
+        li = ET.SubElement(mat3d, f"l{i+1}")
+        pt = ET.SubElement(li, "pt3d")
+        ET.SubElement(pt, "x").text = fmt(R[i][0], 15)
+        ET.SubElement(pt, "y").text = fmt(R[i][1], 15)
+        ET.SubElement(pt, "z").text = fmt(R[i][2], 15)
 
-    mat3d = ET.SubElement(rotation, "mat3d")
-    for row_name, row in zip(("l1", "l2", "l3"), M):
-        l = ET.SubElement(mat3d, row_name)
-        pt3d = ET.SubElement(l, "pt3d")
-        ET.SubElement(pt3d, "x").text = f"{row[0]:.15f}"
-        ET.SubElement(pt3d, "y").text = f"{row[1]:.15f}"
-        ET.SubElement(pt3d, "z").text = f"{row[2]:.15f}"
-
-    intr = ET.SubElement(geometry, "intrinseque")
+    intr = ET.SubElement(geom, "intrinseque")
     sensor = ET.SubElement(intr, "sensor")
+    ET.SubElement(sensor, "name").text = "DRONE_CAMERA"
 
-    ET.SubElement(sensor, "name").text = sensor_name
-
-    calibration_date = ET.SubElement(sensor, "calibration_date")
-    for tag in ("year", "month", "day", "hour", "minute", "second"):
-        ET.SubElement(calibration_date, tag).text = "0"
-    ET.SubElement(calibration_date, "time_system").text = ""
-
+    calib = ET.SubElement(sensor, "calibration_date")
+    for t in ["year","month","day","hour","minute","second"]:
+        ET.SubElement(calib, t).text = "0"
+    ET.SubElement(calib, "time_system")
     ET.SubElement(sensor, "serial_number").text = "UNKNOWN"
 
-    image_size = ET.SubElement(sensor, "image_size")
-    ET.SubElement(image_size, "width").text = str(width)
-    ET.SubElement(image_size, "height").text = str(height)
+    imsz = ET.SubElement(sensor, "image_size")
+    ET.SubElement(imsz, "width").text = str(int(width))
+    ET.SubElement(imsz, "height").text = str(int(height))
 
-    sensor_size = ET.SubElement(sensor, "sensor_size")
-    ET.SubElement(sensor_size, "width").text = str(width)
-    ET.SubElement(sensor_size, "height").text = str(height)
+    ssz = ET.SubElement(sensor, "sensor_size")
+    ET.SubElement(ssz, "width").text = str(int(width))
+    ET.SubElement(ssz, "height").text = str(int(height))
 
     ppa = ET.SubElement(sensor, "ppa")
-    ET.SubElement(ppa, "c").text = fmt_float(ppa_c)
-    ET.SubElement(ppa, "l").text = fmt_float(ppa_l)
-    ET.SubElement(ppa, "focale").text = fmt_float(focal)
+    ET.SubElement(ppa, "c").text = fmt(c, 12)
+    ET.SubElement(ppa, "l").text = fmt(l, 12)
+    ET.SubElement(ppa, "focale").text = fmt(focale, 12)
 
-    if pixel_size is not None:
-        ET.SubElement(sensor, "pixel_size").text = f"{pixel_size:.12g}"
-
-    tree = ET.ElementTree(root)
-    ET.indent(tree, space="    ", level=0)
-    tree.write(out_path, encoding="utf-8", xml_declaration=True)
-
+    return ET.ElementTree(root), img_name
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Convertit un fichier .xyz photogrammétrique OPK en fichiers .CON (un par image)."
-    )
-    ap.add_argument("--xyz", required=True, help="Fichier .xyz d'entrée")
-    ap.add_argument("--out-dir", required=True, help="Dossier de sortie des fichiers .CON")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output_dir", required=True)
+    ap.add_argument("--order", default="RzRyRx", choices=["RzRyRx","RxRyRz"])
+    ap.add_argument("--label", default=None)
+    ap.add_argument("--images_dir", required=True)
+    ap.add_argument("--geodesique", default="LAMBERT93")
+    ap.add_argument("--force_focale", type=float, default=None)
 
-    ap.add_argument("--width", type=int, required=True, help="Largeur image")
-    ap.add_argument("--height", type=int, required=True, help="Hauteur image")
-
-    ap.add_argument("--focal", type=float, default=None,
-                    help="Focale à écrire dans le .CON. Par défaut: valeur c du .xyz")
-
-    ap.add_argument("--ppa-c", type=float, default=None,
-                    help="PPA colonne explicite")
-    ap.add_argument("--ppa-l", type=float, default=None,
-                    help="PPA ligne explicite")
-    ap.add_argument("--use-center-ppa", action="store_true",
-                    help="Utilise width/2 et height/2 au lieu de x0/-y0 du .xyz")
-
-    ap.add_argument("--pixel-size", type=float, default=None, help="Pixel size optionnel")
-    ap.add_argument("--geodesique", default="LAMBERT93", help="Nom du système géodésique")
-    ap.add_argument("--euclidien-type", default="MATISRTL", help="Type de la balise euclidien")
-    ap.add_argument("--sensor-name", default="DRONE_CAMERA", help="Nom du capteur")
-
-    ap.add_argument("--euler-order", default="xyz",
-                    choices=["xyz", "xzy", "yxz", "yzx", "zxy", "zyx"],
-                    help="Ordre Euler utilisé comme base pour omega, phi, kappa")
-    ap.add_argument("--kappa-offset", type=float, default=0.0,
-                    help="Offset ajouté à kappa en degrés. Par défaut: 0 (ancienne version)")
-    ap.add_argument("--convention", default="none",
-                    choices=["none", "swap_xy_cw90", "swap_xy_ccw90", "flip_y", "flip_x", "flip_xy"],
-                    help="Matrice fixe de convention image/caméra à appliquer")
-    ap.add_argument("--convention-side", default="right",
-                    choices=["left", "right"],
-                    help="Applique la convention à gauche ou à droite de la rotation de base")
-    ap.add_argument("--flip-image-180", action="store_true",
-                    help="Applique un retournement de 180° dans le plan image (équivaut à convention flip_xy)")
-    ap.add_argument("--transpose", action="store_true",
-                    help="Transpose la matrice finale avant écriture")
-    ap.add_argument("--image2ground", action="store_true",
-                    help="Écrit Image2Ground=true dans le XML")
-    ap.add_argument("--verbose", action="store_true",
-                    help="Affiche les paramètres de rotation calculés")
+    # Hypothèses
+    ap.add_argument("--flip_ppx", action="store_true", help="c <- width - c")
+    ap.add_argument("--flip_ppy", action="store_true", help="l <- height - l")
+    ap.add_argument("--rot_flip_x", action="store_true", help="flip axe x caméra dans R")
+    ap.add_argument("--rot_flip_y", action="store_true", help="flip axe y caméra dans R")
+    ap.add_argument("--kappa_sign", type=int, choices=[1,-1], default=1)
+    ap.add_argument("--omega_sign", type=int, choices=[1,-1], default=1)
+    ap.add_argument("--phi_sign", type=int, choices=[1,-1], default=1)
 
     args = ap.parse_args()
 
-    xyz_path = Path(args.xyz)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+    images_dir = Path(args.images_dir)
 
-    rows = parse_xyz(xyz_path)
-    if not rows:
-        print("Aucune orientation trouvée.")
-        sys.exit(2)
+    df = pd.read_csv(args.input, sep=r"\s+", engine="python")
+    if "#label" in df.columns:
+        df = df.rename(columns={"#label":"label"})
 
-    effective_convention = args.convention
-    if args.flip_image_180:
-        if args.convention != "none":
-            raise ValueError("--flip-image-180 et --convention ne doivent pas être utilisés ensemble")
-        effective_convention = "flip_xy"
+    req = ["label","X0","Y0","Z0","omega[deg]","phi[deg]","kappa[deg]"]
+    miss = [c for c in req if c not in df.columns]
+    if miss:
+        raise RuntimeError(f"Colonnes manquantes: {miss}")
 
-    for row in rows:
-        image_name = row["label"]
-        stem = Path(image_name).stem
-        out_path = out_dir / f"{stem}.CON"
+    if args.label:
+        target = Path(args.label).stem
+        df = df[df["label"].apply(lambda v: Path(str(v)).stem == target)]
+        if len(df) == 0:
+            raise RuntimeError(f"Image {args.label} introuvable")
 
-        M = build_rotation_matrix_photogrammetry(
-            omega_deg=row["omega_deg"],
-            phi_deg=row["phi_deg"],
-            kappa_deg=row["kappa_deg"],
-            euler_order=args.euler_order,
-            kappa_offset_deg=args.kappa_offset,
-            convention=effective_convention,
-            convention_side=args.convention_side,
-            transpose=args.transpose,
-        )
+    n = 0
+    for _, row in df.iterrows():
+        row = row.copy()
+        row["omega[deg]"] *= args.omega_sign
+        row["phi[deg]"]   *= args.phi_sign
+        row["kappa[deg]"] *= args.kappa_sign
 
-        focal = args.focal if args.focal is not None else row["c"]
+        stem = Path(str(row["label"])).stem
+        jpg = images_dir / f"{stem}.jpg"
+        if not jpg.exists():
+            raise RuntimeError(f"JPG introuvable: {jpg}")
 
-        if args.ppa_c is not None:
-            ppa_c = args.ppa_c
-        elif args.use_center_ppa:
-            ppa_c = args.width / 2.0
+        with Image.open(jpg) as im:
+            width, height = im.size
+            ex = exif_dict(im)
+
+        c = width / 2.0
+        l = height / 2.0
+        if args.flip_ppx: c = width - c
+        if args.flip_ppy: l = height - l
+
+        if args.force_focale is not None:
+            focale = float(args.force_focale)
         else:
-            ppa_c = row["x0"]
+            exif35 = exif_35mm_to_float(ex.get("FocalLengthIn35mmFilm"))
+            focale = estimate_focal_px_from_exif(width, exif35) or 4636.912
 
-        if args.ppa_l is not None:
-            ppa_l = args.ppa_l
-        elif args.use_center_ppa:
-            ppa_l = args.height / 2.0
-        else:
-            ppa_l = -row["y0"]
-
-        if args.verbose:
-            print(
-                f"{stem}: "
-                f"omega={row['omega_deg']:.6f} "
-                f"phi={row['phi_deg']:.6f} "
-                f"kappa={row['kappa_deg']:.6f} "
-                f"kappa_offset={args.kappa_offset:.6f} "
-                f"ppa_c={ppa_c:.6f} "
-                f"ppa_l={ppa_l:.6f} "
-                f"convention={effective_convention}"
-            )
-            print(M)
-
-        write_con_file(
-            out_path=out_path,
-            image_name=image_name,
-            X0=row["X0"],
-            Y0=row["Y0"],
-            Z0=row["Z0"],
-            M=M,
-            width=args.width,
-            height=args.height,
-            focal=focal,
-            ppa_c=ppa_c,
-            ppa_l=ppa_l,
-            geodesique=args.geodesique,
-            euclidien_type=args.euclidien_type,
-            sensor_name=args.sensor_name,
-            pixel_size=args.pixel_size,
-            image2ground=args.image2ground,
+        tree, img_name = build_con(
+            row=row, width=width, height=height, c=c, l=l,
+            focale=focale, geodesique=args.geodesique, order=args.order,
+            rot_flip_x=args.rot_flip_x, rot_flip_y=args.rot_flip_y
         )
+        indent(tree.getroot())
+        tree.write(out / f"{img_name}.CON", encoding="utf-8", xml_declaration=True)
+        n += 1
 
-    print(f"{len(rows)} fichier(s) .CON généré(s) dans {out_dir}")
-
+    print(f"OK: {n} fichier(s) écrit(s) dans {out}")
 
 if __name__ == "__main__":
     main()
