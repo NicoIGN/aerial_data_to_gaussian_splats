@@ -178,6 +178,7 @@ def process_file(
     output_format: str,
     jpeg_quality: int,
     overwrite: bool,
+    flip_x: bool = False,
     verbose: bool = False,
 ):
     src_w, src_h = get_raster_size(input_path)
@@ -191,6 +192,7 @@ def process_file(
     if output_path.exists() and not overwrite:
         if is_valid_output(output_path, (expected_w, expected_h), verbose=verbose):
             verbose_print(f"⏭️ Skip valid existing file {output_path}", verbose)
+            # NOTE: si flip_x demandé et fichier existe déjà, on skip quand même.
             return output_path
         else:
             verbose_print(f"♻️ Existing output invalid, recomputing {output_path}", verbose)
@@ -200,6 +202,10 @@ def process_file(
         factor=factor,
         verbose=verbose,
     )
+
+    if flip_x:
+        verbose_print("↔️ Apply horizontal mirror (flip-x)", verbose)
+        img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
 
     save_image(
         img=img,
@@ -233,6 +239,7 @@ def parse_args():
 
     parser.add_argument("--jpeg-quality", type=int, default=95)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--flip-x", action="store_true", help="Apply horizontal mirror")
     parser.add_argument("--verbose", action="store_true")
 
     return parser.parse_args()
@@ -269,6 +276,7 @@ def main():
     print(f"Output file  : {output_path}")
     print(f"Factor       : {args.factor}")
     print(f"Output format: {output_format}")
+    print(f"Flip X       : {args.flip_x}")
     print("================================")
 
     try:
@@ -279,6 +287,7 @@ def main():
             output_format=output_format,
             jpeg_quality=args.jpeg_quality,
             overwrite=args.overwrite,
+            flip_x=args.flip_x,
             verbose=args.verbose,
         )
     except Exception as e:
