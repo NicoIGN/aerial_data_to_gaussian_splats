@@ -24,73 +24,89 @@ SKIP_IMAGE_PROCESSING=true
 
 MAX_ITER=6000
 
-# Pas de split après l'init LiDAR — on ne veut pas de nouveaux splats
-STOP_SPLIT_AT=0
+# Densification autorisée jusqu'à mi-parcours seulement
+# → les splats s'adaptent en début d'entraînement,
+#   puis la géométrie se fige pour les dernières itérations
+STOP_SPLIT_AT=3000
 
 ########################################
 # LEARNING RATES
-# Principe : position figée, couleur libre, forme contrainte
+# Principe : petits déplacements autorisés en début,
+#            puis décroissance vers quasi-zéro
 ########################################
 
-# 🔒 Position quasi-figée : les splats restent sur les points LiDAR
-# (valeur typique balanced ~0.00016, on divise par ~20)
-POSITION_LR_INIT=0.000008
-POSITION_LR_FINAL=0.0000008
+# 🔒 Position : déplacements limités
+# balanced=0.00016 → ici ×0.15 = léger mais non nul
+# La décroissance exponentielle vers FINAL fige
+# progressivement la géométrie en fin d'entraînement
+POSITION_LR_INIT=0.000024
+POSITION_LR_FINAL=0.0000008    # ~×30 plus bas que INIT → quasi-figé à la fin
 POSITION_LR_DELAY_MULT=0.01
 POSITION_LR_MAX_STEPS=6000
 
-# 🎨 Couleur/opacité : libre pour s'adapter aux images
-FEATURE_LR=0.001
-OPACITY_LR=0.01
+# 🎨 Couleur/opacité : libre
+FEATURE_LR=0.002
+OPACITY_LR=0.02
 
-# 📐 Forme : très contrainte (évite les antennes)
-# (valeur typique ~0.005, on divise par 5)
-SCALING_LR=0.001
-ROTATION_LR=0.0005
-
-########################################
-# GAUSSIAN SPLATTING
-########################################
-
-# Pas de densification (on part du LiDAR dense)
-DENSIFY_GRAD_THRESH=999999999
+# 📐 Forme : contrainte mais pas figée
+# Les splats peuvent s'aplatir sur la surface (disque tangent)
+# mais pas se transformer en aiguilles
+SCALING_LR=0.002
+ROTATION_LR=0.001
 
 ########################################
-# CLEANING / PRUNING
+# GAUSSIAN SPLATTING — DENSIFICATION LÉGÈRE
 ########################################
 
-# Pruning très permissif : on ne veut pas perdre les points LiDAR
-CULL_ALPHA_THRESH=0.01
+# balanced=0.0002 → ici ×3 = densification peu déclenchée
+# Seuls les splats avec un gradient fort (zones floues) splittent
+DENSIFY_GRAD_THRESH=0.0006
+
+# Taille max pour déclencher un split (évite d'exploser les gros splats)
+DENSIFY_SIZE_THRESH=0.01
+
+########################################
+# CLEANING / PRUNING — ACTIF MAIS MODÉRÉ
+########################################
+
+# Pruning actif : supprime les splats fantômes sans tuer les LiDAR utiles
+CULL_ALPHA_THRESH=0.05
+
+# Screen-space : supprime les splats qui couvrent trop d'écran
+# (signe d'un splat mal placé ou trop grand)
 CULL_SCREEN_SIZE=0.15
 
-# 🔑 CLÉ ANTI-ANTENNES : supprime les splats dont
-# scale_max > CULL_SCALE_THRESH × scene_extent
-# Mettre bas pour tuer les filaments
-CULL_SCALE_THRESH=0.1
+# Scale absolue : supprime les splats trop grands
+# (antennes longues, splats qui ont explosé)
+CULL_SCALE_THRESH=0.15
 
 ########################################
 # DENSIFICATION CONTROL
 ########################################
 
-# Refine peu fréquent (juste pour le pruning alpha, pas de split)
-REFINE_EVERY=500
-RESET_ALPHA_EVERY=100
+# Refine fréquent en début pour laisser la géométrie s'adapter,
+# puis le STOP_SPLIT_AT coupe la densification à mi-parcours
+REFINE_EVERY=300
+
+# Reset alpha périodique : force le réseau à re-justifier
+# chaque splat → évite la saturation d'opacité
+RESET_ALPHA_EVERY=60
 
 ########################################
-# QUALITY / REGULARIZATION — CLÉ DU PROFIL
+# QUALITY / REGULARIZATION
 ########################################
 
 USE_BILATERAL_GRID=false
-USE_SCALE_REGULARIZATION=true  # 🔑 pénalise les splats allongés
 
-# 🔑 ANTI-ANTENNES : ratio max entre la plus grande
-# et la plus petite dimension d'un splat
-# balanced=10, ici on met 3 → splats quasi-sphériques/disques
-MAX_GAUSS_RATIO=3.0
+# 🔑 Régularisation scale active : pénalise mathématiquement
+# les splats allongés à chaque step → frein continu aux antennes
+USE_SCALE_REGULARIZATION=true
+SCALE_REG_WEIGHT=0.05          # modéré : assez pour freiner, pas assez pour bloquer
 
-# Régularisation scale : poids de la pénalité sur l'allongement
-# (si supporté par ton build nerfstudio)
-SCALE_REG_WEIGHT=0.1
+# 🔑 Ratio max forme : disque aplati OK (3:1), aiguille interdit
+# Un peu plus permissif que la version figée pour laisser
+# les splats couvrir les surfaces obliques
+MAX_GAUSS_RATIO=6.0
 
 SSIM_LAMBDA=0.2
 
