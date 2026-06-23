@@ -58,17 +58,6 @@ def fmt_float(v: float, digits: int = 12):
     return f"{v:.{digits}f}"
 
 
-def rotation_z_deg(angle_deg: float):
-    a = np.deg2rad(angle_deg)
-    c = np.cos(a)
-    s = np.sin(a)
-    return np.array([
-        [c, -s, 0.0],
-        [s,  c, 0.0],
-        [0.0, 0.0, 1.0],
-    ], dtype=np.float64)
-
-
 def get_convention_matrix(name: str):
     name = (name or "none").lower()
 
@@ -103,6 +92,13 @@ def get_convention_matrix(name: str):
             [0.0,  0.0, 1.0],
         ], dtype=np.float64)
 
+    if name == "flip_xy":
+        return np.array([
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0,  0.0, 1.0],
+        ], dtype=np.float64)
+
     raise ValueError(f"Convention inconnue: {name}")
 
 
@@ -112,18 +108,11 @@ def build_rotation_matrix_photogrammetry(
     kappa_deg: float,
     *,
     euler_order: str = "xyz",
-    kappa_offset_deg: float = -90.0,
+    kappa_offset_deg: float = 0.0,
     convention: str = "none",
     convention_side: str = "right",
     transpose: bool = False,
 ):
-    """
-    Hypothèse pratique:
-    - OPK lu comme une rotation Euler de base
-    - correction fixe par offset sur kappa
-    - éventuelle matrice fixe de convention image/caméra
-    """
-
     base = R.from_euler(
         euler_order,
         [omega_deg, phi_deg, kappa_deg + kappa_offset_deg],
@@ -260,10 +249,13 @@ def main():
 
     ap.add_argument("--focal", type=float, default=None,
                     help="Focale à écrire dans le .CON. Par défaut: valeur c du .xyz")
+
     ap.add_argument("--ppa-c", type=float, default=None,
-                    help="PPA colonne. Par défaut: centre image width/2")
+                    help="PPA colonne explicite")
     ap.add_argument("--ppa-l", type=float, default=None,
-                    help="PPA ligne. Par défaut: centre image height/2")
+                    help="PPA ligne explicite")
+    ap.add_argument("--use-center-ppa", action="store_true",
+                    help="Utilise width/2 et height/2 au lieu de x0/-y0 du .xyz")
 
     ap.add_argument("--pixel-size", type=float, default=None, help="Pixel size optionnel")
     ap.add_argument("--geodesique", default="LAMBERT93", help="Nom du système géodésique")
@@ -273,14 +265,16 @@ def main():
     ap.add_argument("--euler-order", default="xyz",
                     choices=["xyz", "xzy", "yxz", "yzx", "zxy", "zyx"],
                     help="Ordre Euler utilisé comme base pour omega, phi, kappa")
-    ap.add_argument("--kappa-offset", type=float, default=-90.0,
-                    help="Offset ajouté à kappa en degrés. Par défaut: -90")
+    ap.add_argument("--kappa-offset", type=float, default=0.0,
+                    help="Offset ajouté à kappa en degrés. Par défaut: 0 (ancienne version)")
     ap.add_argument("--convention", default="none",
-                    choices=["none", "swap_xy_cw90", "swap_xy_ccw90", "flip_y", "flip_x"],
+                    choices=["none", "swap_xy_cw90", "swap_xy_ccw90", "flip_y", "flip_x", "flip_xy"],
                     help="Matrice fixe de convention image/caméra à appliquer")
     ap.add_argument("--convention-side", default="right",
                     choices=["left", "right"],
                     help="Applique la convention à gauche ou à droite de la rotation de base")
+    ap.add_argument("--flip-image-180", action="store_true",
+                    help="Applique un retournement de 180° dans le plan image (équivaut à convention flip_xy)")
     ap.add_argument("--transpose", action="store_true",
                     help="Transpose la matrice finale avant écriture")
     ap.add_argument("--image2ground", action="store_true",
@@ -299,6 +293,12 @@ def main():
         print("Aucune orientation trouvée.")
         sys.exit(2)
 
+    effective_convention = args.convention
+    if args.flip_image_180:
+        if args.convention != "none":
+            raise ValueError("--flip-image-180 et --convention ne doivent pas être utilisés ensemble")
+        effective_convention = "flip_xy"
+
     for row in rows:
         image_name = row["label"]
         stem = Path(image_name).stem
@@ -310,14 +310,26 @@ def main():
             kappa_deg=row["kappa_deg"],
             euler_order=args.euler_order,
             kappa_offset_deg=args.kappa_offset,
-            convention=args.convention,
+            convention=effective_convention,
             convention_side=args.convention_side,
             transpose=args.transpose,
         )
 
         focal = args.focal if args.focal is not None else row["c"]
-        ppa_c = args.ppa_c if args.ppa_c is not None else (args.width / 2.0)
-        ppa_l = args.ppa_l if args.ppa_l is not None else (args.height / 2.0)
+
+        if args.ppa_c is not None:
+            ppa_c = args.ppa_c
+        elif args.use_center_ppa:
+            ppa_c = args.width / 2.0
+        else:
+            ppa_c = row["x0"]
+
+        if args.ppa_l is not None:
+            ppa_l = args.ppa_l
+        elif args.use_center_ppa:
+            ppa_l = args.height / 2.0
+        else:
+            ppa_l = -row["y0"]
 
         if args.verbose:
             print(
@@ -325,7 +337,10 @@ def main():
                 f"omega={row['omega_deg']:.6f} "
                 f"phi={row['phi_deg']:.6f} "
                 f"kappa={row['kappa_deg']:.6f} "
-                f"kappa_offset={args.kappa_offset:.6f}"
+                f"kappa_offset={args.kappa_offset:.6f} "
+                f"ppa_c={ppa_c:.6f} "
+                f"ppa_l={ppa_l:.6f} "
+                f"convention={effective_convention}"
             )
             print(M)
 
