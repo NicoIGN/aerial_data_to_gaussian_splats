@@ -138,27 +138,25 @@ def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None)
 
 
 def prepare_selected_images(source_paths, output_dir: Path, factor: float, jpeg_quality: int,
-                            verbose: int, image_convertor_script: Path, mirror_x_by_stem=None):
+                            verbose: int, image_convertor_script: Path):
     ensure_dir(output_dir)
 
     if not image_convertor_script.exists():
         raise FileNotFoundError(f"Script de conversion introuvable: {image_convertor_script}")
 
     produced = {}
-    mirror_x_by_stem = mirror_x_by_stem or {}
 
     for src_path in source_paths:
         src_path = Path(src_path)
         stem = src_path.stem
         ext = src_path.suffix.lower()
-        do_mirror_x = bool(mirror_x_by_stem.get(stem, False))
 
         if ext in {".jp2", ".tif", ".tiff"}:
             out_path = output_dir / f"{stem}.jpg"
             output_mode = "--jpg"
 
         elif ext in {".jpg", ".jpeg", ".png", ".bmp"}:
-            if factor <= 1.0 and not do_mirror_x:
+            if factor <= 1.0:
                 out_path = output_dir / src_path.name
                 log(f"  Copie: {src_path.name}", 2, verbose)
                 shutil.copy2(src_path, out_path)
@@ -190,13 +188,10 @@ def prepare_selected_images(source_paths, output_dir: Path, factor: float, jpeg_
             "--jpeg-quality", str(jpeg_quality),
         ]
 
-        if do_mirror_x:
-            cmd.append("--flip-x")
-
         if verbose >= 1:
             cmd.append("--verbose")
 
-        log(f"  Conversion: {src_path.name} -> {out_path.name}" + (" [flip-x]" if do_mirror_x else ""), 2, verbose)
+        log(f"  Conversion: {src_path.name} -> {out_path.name}", 2, verbose)
         subprocess.run(cmd, check=True)
 
         if not out_path.exists():
@@ -282,7 +277,11 @@ def parse_con_orientation(con_path: Path):
     northing = float(sommet.findtext("northing"))
     altitude = float(sommet.findtext("altitude"))
 
-    center = np.array([eucl_x + easting, eucl_y + northing, altitude], dtype=np.float64)
+    center = np.array([
+        eucl_x + easting,
+        eucl_y + northing,
+        altitude,
+    ], dtype=np.float64)
 
     image2ground_txt = rotation.findtext("Image2Ground")
     image2ground = str(image2ground_txt).strip().lower() == "true"
@@ -291,23 +290,26 @@ def parse_con_orientation(con_path: Path):
         row = rotation.find(f"mat3d/{row_tag}/pt3d")
         if row is None:
             raise ValueError(f"{con_path}: ligne {row_tag} absente dans rotation/mat3d")
-        return [float(row.findtext("x")), float(row.findtext("y")), float(row.findtext("z"))]
+        return [
+            float(row.findtext("x")),
+            float(row.findtext("y")),
+            float(row.findtext("z")),
+        ]
 
-    M = np.array([_read_row("l1"), _read_row("l2"), _read_row("l3")], dtype=np.float64)
+    M = np.array([
+        _read_row("l1"),
+        _read_row("l2"),
+        _read_row("l3"),
+    ], dtype=np.float64)
 
-    R_cw = M.T if image2ground else M
+    if image2ground:
+        R_cw = M.T
+    else:
+        R_cw = M
 
-    # Convention validée sur ton cas test: R_cw = -M.T
-    R_cw = -M.T
-
-    det_before = float(np.linalg.det(R_cw))
-    orth_err = float(np.linalg.norm(R_cw.T @ R_cw - np.eye(3), ord="fro"))
-    if orth_err > 1e-3 or abs(det_before - 1.0) > 1e-3:
-        raise ValueError(
-            f"{con_path}: rotation invalide (orth_err={orth_err}, det={det_before})"
-        )
-
-    mirror_x_needed = False
+    det = np.linalg.det(R_cw)
+    if det <= 0:
+        raise ValueError(f"{con_path}: rotation invalide, det={det}")
 
     tvec = -R_cw @ center
 
@@ -351,9 +353,8 @@ def parse_con_orientation(con_path: Path):
         "pixel_size": pixel_size,
         "image2ground": image2ground,
         "transfo2d": transfo2d,
-        "mirror_x_needed": mirror_x_needed,
-        "det_before": det_before,
     }
+
 
 def scale_intrinsics(width, height, fx, fy, cx, cy, factor):
     factor = max(float(factor), 1.0)
@@ -1009,18 +1010,13 @@ def main():
     frames = []
     intrinsics_ref = None
     skipped_no_con = 0
-    n_mirror_x = 0
 
     for stem, src_img in sorted(image_index.items()):
-        con_path = images_dir / f"{stem}.CON"
+        con_path = src_img.with_suffix(".CON")
         if not con_path.exists():
-            con_path = images_dir / f"{stem}.con"
+            con_path = src_img.with_suffix(".con")
 
         if not con_path.exists():
-            candidates = [p for p in images_dir.glob(f"{stem}.*") if p.suffix.lower() == ".con"]
-            con_path = candidates[0] if candidates else None
-
-        if con_path is None or not con_path.exists():
             log(f"[WARN] .CON introuvable pour {src_img.name}", 2, args.verbose)
             skipped_no_con += 1
             continue
@@ -1035,12 +1031,6 @@ def main():
             ori["width"], ori["height"], ori["fx"], ori["fy"], ori["cx"], ori["cy"], factor
         )
         transfo2d_scaled = scale_transfo2d(ori["transfo2d"], factor)
-
-        # Si det<0 corrigé dans parse_con_orientation -> miroir image X + correction du cx
-        mirror_x_needed = bool(ori.get("mirror_x_needed", False))
-        if mirror_x_needed:
-            cx = (width - 1) - cx
-            n_mirror_x += 1
 
         if intrinsics_ref is None:
             intrinsics_ref = (width, height, fx, fy, cx, cy)
@@ -1081,16 +1071,18 @@ def main():
             "cx": cx,
             "cy": cy,
             "transfo2d": transfo2d_scaled,
-            "mirror_x_needed": mirror_x_needed,
         })
 
         if transfo2d_scaled is not None:
-            log(f"  {con_path.name}: transfo2d appliqué = {transfo2d_scaled}", 1, args.verbose)
+            log(
+                f"  {con_path.name}: transfo2d appliqué = {transfo2d_scaled}",
+                1,
+                args.verbose,
+            )
 
     log(f"  Total images avec .CON retenues: {len(frames)}", 1, args.verbose)
     if skipped_no_con > 0:
         log(f"  Images ignorées faute de .CON: {skipped_no_con}", 1, args.verbose)
-    log(f"  Images nécessitant miroir X (det<0): {n_mirror_x}", 1, args.verbose)
 
     if not frames:
         print("Aucune image exploitable avec fichier .CON trouvé.")
@@ -1107,7 +1099,9 @@ def main():
         log("[3b/8] Filtrage du LAZ par bbox XY...", 1, args.verbose)
         before_bbox = len(pts_xyz_raw)
         pts_xyz_raw, pts_rgb = filter_xy_bbox(
-            pts_xyz_raw, pts_rgb, xmin=args.xmin, xmax=args.xmax, ymin=args.ymin, ymax=args.ymax
+            pts_xyz_raw, pts_rgb,
+            xmin=args.xmin, xmax=args.xmax,
+            ymin=args.ymin, ymax=args.ymax,
         )
         log(f"  {len(pts_xyz_raw)}/{before_bbox} points conservés dans la bbox.", 1, args.verbose)
 
@@ -1151,8 +1145,6 @@ def main():
 
     log("[6/8] Préparation des images utiles uniquement (conversion / copie / sous-échantillonnage)...", 1, args.verbose)
     selected_source_paths = [Path(fr["source_image"]) for fr in frames]
-    mirror_x_by_stem = {fr["source_stem"]: fr.get("mirror_x_needed", False) for fr in frames}
-
     exported_index = prepare_selected_images(
         source_paths=selected_source_paths,
         output_dir=out_images,
@@ -1160,7 +1152,6 @@ def main():
         jpeg_quality=args.jpeg_quality,
         verbose=args.verbose,
         image_convertor_script=image_convertor_script,
-        mirror_x_by_stem=mirror_x_by_stem,
     )
 
     for fr in frames:
@@ -1192,7 +1183,12 @@ def main():
             args.verbose,
         )
 
-    write_scene_normalization_json(normalization_json, applied_transform, applied_scale, centers)
+    write_scene_normalization_json(
+        normalization_json,
+        applied_transform,
+        applied_scale,
+        centers,
+    )
 
     log("[8/8] Écriture COLMAP, sparse_pc.ply, transforms.json + conversion binaire...", 1, args.verbose)
     write_cameras_txt_single_camera(out_sparse / "cameras.txt", width, height, fx, fy, cx, cy)
