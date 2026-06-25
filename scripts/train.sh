@@ -266,9 +266,21 @@ if [[ -d "$BASE_DIR" ]]; then
   fi
 fi
 
+LOAD_STEP=""
+
 if [[ -z "${RELOAD_FROM_CHECKPOINT:-}" || "${RELOAD_FROM_CHECKPOINT}" =~ ^(false|False|FALSE|0|off|OFF|no|NO)$ ]]; then
     LOAD_DIR=""
+else
+    if [[ -n "$LOAD_DIR" ]]; then
+      # prend le dernier step-XXXXXXXX.ckpt du load_dir
+      LAST_CKPT=$(ls -1 "$LOAD_DIR"/step-*.ckpt 2>/dev/null | sort | tail -n 1)
+      if [[ -n "$LAST_CKPT" ]]; then
+        LOAD_STEP=$(basename "$LAST_CKPT" | sed -E 's/^step-0*([0-9]+)\.ckpt$/\1/')
+        echo "🔢 LOAD_STEP resolved to: $LOAD_STEP"
+      fi
 fi
+
+
 
 # ======================
 # RUN TIMESTAMP
@@ -309,7 +321,11 @@ add_bool_arg COMMON_ARGS --logging.local-writer.enable True
 add_bool_arg COMMON_ARGS --viewer.quit-on-train-completion True
 
 add_arg COMMON_ARGS --load-dir "$LOAD_DIR"
-
+if [[ -n "${LOAD_STEP:-}" ]]; then
+  add_arg COMMON_ARGS --load-step "$LOAD_STEP"
+else
+  echo "ℹ️ LOAD_STEP empty -> starting from iteration 0"
+fi
 # ======================
 # PERFORMANCE ARGS
 # ======================

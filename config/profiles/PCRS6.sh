@@ -22,11 +22,11 @@ SKIP_IMAGE_PROCESSING=true
 # TRAINING
 ########################################
 
-MAX_ITER=8000
+MAX_ITER=5000
 
 # Split autorisé jusqu'aux 2/3 de l'entraînement
 # → plus de temps pour combler les zones floues
-STOP_SPLIT_AT=5000
+STOP_SPLIT_AT=3500
 
 ########################################
 # LEARNING RATES
