@@ -5,6 +5,8 @@ import argparse
 import json
 import shutil
 import sys
+from datetime import datetime
+import time
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import subprocess
@@ -382,22 +384,27 @@ def scale_transfo2d(transfo2d, factor):
     return scaled
 
 
-def project_point(R_cw, t_cw, fx, fy, cx, cy, xyz, transfo2d=None):
+def project_point(R_cw, t_cw, fx, fy, cx, cy, xyz, transfo2d=None, z_positive=True):
     Xc = R_cw @ xyz + t_cw
-    z = float(Xc[2])
+    z_raw = float(Xc[2])
 
-    if z <= 1e-9:
-        return None
+    if z_positive:
+        if z_raw <= 1e-9:
+            return None
+        z = z_raw
+    else:
+        if z_raw >= -1e-9:
+            return None
+        z = -z_raw
 
     u = fx * (Xc[0] / z) + cx
     v = fy * (Xc[1] / z) + cy
 
     u, v = apply_cylindrical_systematism_local_to_image(u, v, transfo2d)
-
     return np.array([u, v], dtype=np.float64), z
 
 
-def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_points=None, verbose=1):
+def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_points=None, verbose=1, z_positive=True):
     num_pts_total = len(pts_xyz)
 
     if num_pts_total == 0:
@@ -428,6 +435,64 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
         verbose,
     )
 
+    # ---------------------------
+    # DEBUG SANITY CHECK (rapide)
+    # ---------------------------
+    if verbose >= 1 and len(frames) > 0 and len(pts_xyz) > 0:
+        sample_n_pts = min(2000, len(pts_xyz))
+        sample_n_cam = min(5, len(frames))
+        sample_idx = np.linspace(0, len(pts_xyz) - 1, num=sample_n_pts, dtype=np.int64)
+
+        log("[DEBUG] Sanity check projections (échantillon)...", 1, verbose)
+
+        for fr in frames[:sample_n_cam]:
+            image_id = fr["image_id"]
+            R_cw = fr["R_cw"]
+            t_cw = fr["tvec"]
+            width = fr["width"]
+            height = fr["height"]
+            fx = fr["fx"]
+            fy = fr["fy"]
+            cx = fr["cx"]
+            cy = fr["cy"]
+            transfo2d = fr.get("transfo2d")
+
+            pos_z = 0
+            in_img = 0
+            z_vals = []
+
+            for idx in sample_idx:
+                xyz = pts_xyz[idx]
+                Xc = R_cw @ xyz + t_cw
+                z = float(Xc[2])
+                z_vals.append(z)
+
+                if z <= 1e-9:
+                    continue
+
+                pos_z += 1
+
+                u = fx * (Xc[0] / z) + cx
+                v = fy * (Xc[1] / z) + cy
+                u, v = apply_cylindrical_systematism_local_to_image(u, v, transfo2d)
+
+                if 0.0 <= u < width and 0.0 <= v < height:
+                    in_img += 1
+
+            z_vals = np.asarray(z_vals, dtype=np.float64)
+            zmin = float(z_vals.min()) if len(z_vals) > 0 else float("nan")
+            zmed = float(np.median(z_vals)) if len(z_vals) > 0 else float("nan")
+            zmax = float(z_vals.max()) if len(z_vals) > 0 else float("nan")
+
+            log(
+                f"[DEBUG][img {image_id}] "
+                f"z>0: {pos_z}/{sample_n_pts} | in_img: {in_img}/{sample_n_pts} | "
+                f"z(min/med/max)=({zmin:.3f}/{zmed:.3f}/{zmax:.3f}) | "
+                f"w,h=({width},{height}) fx,fy=({fx:.3f},{fy:.3f}) cx,cy=({cx:.3f},{cy:.3f})",
+                1,
+                verbose,
+            )
+
     iterable = selected_indices
     use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
     if use_tqdm:
@@ -455,8 +520,11 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
             transfo2d = fr.get("transfo2d")
 
             proj = project_point(
-                R_cw, t_cw, fx, fy, cx, cy, xyz, transfo2d=transfo2d
+                R_cw, t_cw, fx, fy, cx, cy, xyz,
+                transfo2d=transfo2d,
+                z_positive=z_positive,
             )
+            
             if proj is None:
                 continue
 
@@ -495,8 +563,9 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
             1,
             verbose,
         )
-
+    
     tracked_points = sum(1 for tr in tracks_by_point if len(tr) > 0)
+
     log(
         f"  Points terrain ayant au moins une observation: {tracked_points}",
         1,
@@ -506,7 +575,7 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
     return observations_by_image, tracks_by_point
 
 
-def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by_image):
+def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by_image, verbose=1, remap=False):
     kept_old_indices = [i for i, tr in enumerate(tracks_by_point) if len(tr) > 0]
 
     if len(kept_old_indices) == 0:
@@ -515,61 +584,141 @@ def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by
         tracks_kept = []
         observations_new = {k: [] for k in observations_by_image}
         old_to_new_point_id = {}
-        return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new, old_to_new_point_id
+        point3d_ids_kept = np.zeros((0,), dtype=np.int64)
+        return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new, old_to_new_point_id, point3d_ids_kept
 
-    old_to_new_point_id = {old_idx + 1: new_id for new_id, old_idx in enumerate(kept_old_indices, start=1)}
+    # IDs originaux (COLMAP) = old_idx + 1
+    point3d_ids_kept = np.asarray([old_idx + 1 for old_idx in kept_old_indices], dtype=np.int64)
+
+    if remap:
+        # mapping dict conservé pour compat
+        old_to_new_point_id = {old_idx + 1: new_id for new_id, old_idx in enumerate(kept_old_indices, start=1)}
+    else:
+        # identité sur les points conservés
+        old_to_new_point_id = {old_idx + 1: old_idx + 1 for old_idx in kept_old_indices}
 
     pts_xyz_kept = pts_xyz[kept_old_indices]
     pts_rgb_kept = None if pts_rgb is None else pts_rgb[kept_old_indices]
     tracks_kept = [tracks_by_point[i] for i in kept_old_indices]
 
-    observations_new = {}
-    for image_id, obs_list in observations_by_image.items():
-        new_obs_list = []
-        for obs in obs_list:
-            old_pid = obs["point3d_id"]
-            if old_pid in old_to_new_point_id:
-                new_obs = dict(obs)
-                new_obs["point3d_id"] = old_to_new_point_id[old_pid]
-                new_obs_list.append(new_obs)
-        observations_new[image_id] = new_obs_list
+    if remap:
+        # --- FAST REMAP ---
+        n_old = len(tracks_by_point)
+        lut = np.zeros(n_old + 1, dtype=np.int64)  # lut[old_pid] -> new_pid ; 0 = rejeté
+        for new_pid, old_idx in enumerate(kept_old_indices, start=1):
+            lut[old_idx + 1] = new_pid
 
-    return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new, old_to_new_point_id
+        observations_new = {}
+        items = observations_by_image.items()
+        use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
+        if use_tqdm:
+            items = tqdm(
+                items,
+                total=len(observations_by_image),
+                desc="Remap observations",
+                unit="img",
+            )
+
+        for image_id, obs_list in items:
+            new_obs_list = []
+            append = new_obs_list.append
+
+            for obs in obs_list:
+                old_pid = obs["point3d_id"]
+                if 0 < old_pid <= n_old:
+                    new_pid = int(lut[old_pid])
+                    if new_pid != 0:
+                        append({
+                            "xy": obs["xy"],
+                            "point3d_id": new_pid,
+                        })
+
+            observations_new[image_id] = new_obs_list
+
+        # En mode remap, IDs écrits dans points3D.txt = 1..N_kept
+        point3d_ids_kept = np.arange(1, len(kept_old_indices) + 1, dtype=np.int64)
+
+    else:
+        # Pas de remap: observations inchangées (IDs originaux)
+        observations_new = observations_by_image
+
+    return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new, old_to_new_point_id, point3d_ids_kept
 
 
 def filter_frames_with_observations_and_remap(frames, observations_by_image, tracks_by_point, verbose=1):
+    use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
+
+    # 1) Garde uniquement les frames ayant des observations
     kept_frames = []
     old_to_new_image_id = {}
 
     for fr in frames:
         old_id = fr["image_id"]
-        obs = observations_by_image.get(old_id, [])
-        if len(obs) == 0:
+        if not observations_by_image.get(old_id):  # plus rapide que len(...) == 0
             continue
 
-        new_fr = dict(fr)
         new_id = len(kept_frames) + 1
+        new_fr = dict(fr)
         new_fr["image_id"] = new_id
         kept_frames.append(new_fr)
         old_to_new_image_id[old_id] = new_id
 
+    # Si aucune frame conservée, sortie rapide
+    if not kept_frames:
+        log(
+            f"  Images conservées après filtrage par observations: 0/{len(frames)}",
+            1,
+            verbose,
+        )
+        return [], {}, [[] for _ in range(len(tracks_by_point))], {}
+
+    # 2) Remap observations par image (sans dict(o): on conserve les objets obs)
     new_observations_by_image = {}
     for old_id, new_id in old_to_new_image_id.items():
         obs_list = observations_by_image.get(old_id, [])
-        new_observations_by_image[new_id] = [dict(o) for o in obs_list]
+        new_observations_by_image[new_id] = obs_list
 
-    new_tracks_by_point = []
-    for track in tracks_by_point:
+    # 3) LUT dense pour remap image_id -> new_image_id (évite lookup dict dans la boucle interne)
+    max_old_image_id = max(fr["image_id"] for fr in frames) if frames else 0
+    image_lut = np.zeros(max_old_image_id + 1, dtype=np.int32)
+    for old_id, new_id in old_to_new_image_id.items():
+        image_lut[int(old_id)] = int(new_id)
+
+    # 4) Remap tracks (partie la plus lourde) + barre de progression
+    new_tracks_by_point = [None] * len(tracks_by_point)
+
+    iterable = enumerate(tracks_by_point)
+    if use_tqdm:
+        iterable = tqdm(
+            iterable,
+            total=len(tracks_by_point),
+            desc="Remap tracks",
+            unit="pt",
+        )
+
+    lut_len = len(image_lut)
+    for i, track in iterable:
+        if not track:
+            new_tracks_by_point[i] = []
+            continue
+
         remapped_track = []
+        append = remapped_track.append
+
         for tr in track:
-            old_image_id = tr["image_id"]
-            if old_image_id in old_to_new_image_id:
-                remapped_track.append({
-                    "image_id": int(old_to_new_image_id[old_image_id]),
-                    "point2d_idx": int(tr["point2d_idx"]),
-                })
-        remapped_track.sort(key=lambda x: (x["image_id"], x["point2d_idx"]))
-        new_tracks_by_point.append(remapped_track)
+            old_image_id = int(tr["image_id"])
+            if 0 < old_image_id < lut_len:
+                new_image_id = int(image_lut[old_image_id])
+                if new_image_id != 0:
+                    append({
+                        "image_id": new_image_id,
+                        "point2d_idx": int(tr["point2d_idx"]),
+                    })
+
+        if len(remapped_track) > 1:
+            remapped_track.sort(key=lambda x: (x["image_id"], x["point2d_idx"]))
+
+        new_tracks_by_point[i] = remapped_track
 
     log(
         f"  Images conservées après filtrage par observations: {len(kept_frames)}/{len(frames)}",
@@ -618,21 +767,41 @@ def write_images_txt(path: Path, frames, observations_by_image):
             f.write(" ".join(line) + "\n")
 
 
-def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None, tracks_by_point=None):
+def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None, tracks_by_point=None, point3d_ids=None, verbose=1):
     if pts_rgb is None:
         pts_rgb = np.full((len(pts_xyz), 3), 200, dtype=np.uint8)
 
     if tracks_by_point is None:
         tracks_by_point = [[] for _ in range(len(pts_xyz))]
 
+    if point3d_ids is None:
+        point3d_ids = np.arange(1, len(pts_xyz) + 1, dtype=np.int64)
+
+    if len(point3d_ids) != len(pts_xyz):
+        raise ValueError(
+            f"point3d_ids et pts_xyz doivent avoir la même longueur "
+            f"(ids={len(point3d_ids)} vs pts={len(pts_xyz)})"
+        )
+
+    use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
+    iterable = zip(point3d_ids, pts_xyz, pts_rgb, tracks_by_point)
+
+    if use_tqdm:
+        iterable = tqdm(
+            iterable,
+            total=len(pts_xyz),
+            desc="Écriture points3D.txt",
+            unit="pt",
+        )
+
     with open(path, "w", encoding="utf-8") as f:
         f.write("# 3D point list with one line of data per point:\n")
         f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
         f.write(f"# Number of points: {len(pts_xyz)}\n")
 
-        for i, (p, c, track) in enumerate(zip(pts_xyz, pts_rgb, tracks_by_point), start=1):
+        for pid, p, c, track in iterable:
             parts = [
-                str(i),
+                str(int(pid)),
                 f"{p[0]:.12f}",
                 f"{p[1]:.12f}",
                 f"{p[2]:.12f}",
@@ -975,9 +1144,17 @@ def main():
     ap.add_argument("--xmax", type=float, default=None, help="Borne maximale X optionnelle pour filtrer le LAZ")
     ap.add_argument("--ymin", type=float, default=None, help="Borne minimale Y optionnelle pour filtrer le LAZ")
     ap.add_argument("--ymax", type=float, default=None, help="Borne maximale Y optionnelle pour filtrer le LAZ")
+    ap.add_argument("--remap", action="store_true",
+                    help="Remappe les POINT3D_ID en [1..N_kept]. Par défaut désactivé (IDs originaux conservés).")
+    ap.add_argument("--z-negative", action="store_true",
+                    help="Utilise la convention profondeur z<0 (par défaut: z>0).")
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                     help="0=silencieux, 1=info, 2=warn+info")
     args = ap.parse_args()
+    
+    t0 = time.perf_counter()
+    dt_start = datetime.now()
+    log(f"[TIME] Début: {dt_start.strftime('%Y-%m-%d %H:%M:%S')}", 1, args.verbose)
 
     laz_path = Path(args.laz)
     images_dir = Path(args.images)
@@ -992,6 +1169,9 @@ def main():
     out_models_0 = out_sparse / "models" / "0"
     sparse_pc_ply = out_dir / "sparse_pc.ply"
     normalization_json = out_dir / "scene_normalization.json"
+    
+    z_positive = not args.z_negative
+    log(f"[CONFIG] z_positive={z_positive}", 1, args.verbose)
 
     for d in [out_images, out_sparse, out_models_0]:
         ensure_dir(d)
@@ -1115,14 +1295,17 @@ def main():
         pts_xyz=pts_xyz_raw,
         pts_rgb=pts_rgb,
         num_terrain_points=args.num_terrain_points,
+        z_positive=z_positive,
         verbose=args.verbose,
     )
 
-    pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_by_image, old_to_new_point_id = filter_points_with_tracks(
+    pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_by_image, old_to_new_point_id, point3d_ids_kept = filter_points_with_tracks(
         pts_xyz=pts_xyz_raw,
         pts_rgb=pts_rgb,
         tracks_by_point=tracks_by_point,
         observations_by_image=observations_by_image,
+        verbose=args.verbose,
+        remap=args.remap,
     )
 
     log(f"  Points 3D exportés avec tracks: {len(pts_xyz_kept)}", 1, args.verbose)
@@ -1168,8 +1351,8 @@ def main():
     applied_transform = get_nerfstudio_axis_transform_4x4()
     applied_scale = 1.0
 
-    log(f"  applied_scale = {applied_scale:.12f}", 1, args.verbose)
-    log(f"  applied_transform =\n{applied_transform}", 1, args.verbose)
+    log(f"  applied_scale = {applied_scale:.12f}", 2, args.verbose)
+    log(f"  applied_transform =\n{applied_transform}", 2, args.verbose)
 
     pts_xyz_kept_ns = apply_transform_to_points(pts_xyz_kept, applied_transform, applied_scale)
 
@@ -1193,7 +1376,14 @@ def main():
     log("[8/8] Écriture COLMAP, sparse_pc.ply, transforms.json + conversion binaire...", 1, args.verbose)
     write_cameras_txt_single_camera(out_sparse / "cameras.txt", width, height, fx, fy, cx, cy)
     write_images_txt(out_sparse / "images.txt", frames, observations_by_image)
-    write_points3D_txt(out_sparse / "points3D.txt", pts_xyz_kept, pts_rgb_kept, tracks_kept)
+    write_points3D_txt(
+        out_sparse / "points3D.txt",
+        pts_xyz_kept,
+        pts_rgb_kept,
+        tracks_kept,
+        point3d_ids=point3d_ids_kept,
+        verbose=args.verbose,
+    )
     write_ply_xyzrgb(sparse_pc_ply, pts_xyz_kept_ns, pts_rgb_kept)
 
     build_transforms_json(
@@ -1223,6 +1413,17 @@ def main():
     print(f"Sparse PLY Nerfstudio: {sparse_pc_ply}")
     print(f"Transforms Nerfstudio: {out_dir / 'transforms.json'}")
     print(f"Normalisation: {normalization_json}")
+    
+    dt_end = datetime.now()
+    elapsed_s = time.perf_counter() - t0
+
+    h = int(elapsed_s // 3600)
+    m = int((elapsed_s % 3600) // 60)
+    s = elapsed_s % 60
+
+    print(f"Heure début: {dt_start.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Heure fin  : {dt_end.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Durée totale: {h:02d}:{m:02d}:{int(s):02d}")
 
 
 if __name__ == "__main__":

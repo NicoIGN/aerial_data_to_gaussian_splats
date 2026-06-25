@@ -628,7 +628,7 @@ def get_intrinsics_from_camera(cam):
     return K, cam["width"], cam["height"], dist
 
 
-def project_world_point(colmap_image, cam, xyz):
+def project_world_point(colmap_image, cam, xyz, z_positive=True):
     xyz = np.asarray(xyz, dtype=np.float64).reshape(3)
 
     qvec = np.asarray(colmap_image["qvec"], dtype=np.float64)
@@ -636,9 +636,16 @@ def project_world_point(colmap_image, cam, xyz):
     R_cw = qvec_to_rotmat(qvec)
 
     Xc = R_cw @ xyz + tvec
-    z = float(Xc[2])
-    if z <= 1e-9:
-        return None
+    z_raw = float(Xc[2])
+
+    if z_positive:
+        if z_raw <= 1e-9:
+            return None
+        z = z_raw
+    else:
+        if z_raw >= -1e-9:
+            return None
+        z = -z_raw
 
     K, width, height, dist = get_intrinsics_from_camera(cam)
 
@@ -796,14 +803,15 @@ def draw_zoomed_projections_on_image(image_path: Path, uv_fullres, full_w, full_
 
 class InspectorApp:
     def __init__(self, pointcloud_data, colmap_images, colmap_cameras,
-                 colmap_dir: Path, point_size=2.0, frustum_scale=None, verbose=False):
+                 colmap_dir: Path, point_size=2.0, frustum_scale=None, z_positive=True, verbose=False):
 
         self.pointcloud_data = pointcloud_data
         self.raw_pointcloud = o3d.geometry.PointCloud(pointcloud_data["pcd"])
         self.points_xyz = pointcloud_data["xyz"]
         self.point_ids = pointcloud_data["point_ids"]
         self.point_observations = pointcloud_data.get("observations", {})
-
+        self.z_positive = bool(z_positive)
+        
         self.point_id_to_global_index = {
             int(pid): idx for idx, pid in enumerate(self.point_ids)
         }
@@ -1715,6 +1723,7 @@ class InspectorApp:
                     colmap_image,
                     cam,
                     self.selected_point_xyz,
+                    z_positive=self.z_positive,
                 )
 
             except NotImplementedError as e:
@@ -1816,6 +1825,11 @@ def main():
         default=None,
         help="Taille relative des caméras. Si omis, valeur auto basée sur l'espacement moyen entre poses.",
     )
+    ap.add_argument(
+        "--z-negative",
+        action="store_true",
+        help="Utilise la convention profondeur z<0 (par défaut: z>0)."
+    )
     ap.add_argument("--verbose", action="store_true", help="Logs détaillés")
     args = ap.parse_args()
 
@@ -1835,6 +1849,9 @@ def main():
     colmap_images = load_colmap_images(colmap_dir)
     colmap_cameras = load_colmap_cameras(colmap_dir)
 
+    z_positive = not args.z_negative
+    info(f"Convention profondeur: {'z>0' if z_positive else 'z<0'}")
+
     app = InspectorApp(
         pointcloud_data=pointcloud_data,
         colmap_images=colmap_images,
@@ -1842,6 +1859,7 @@ def main():
         colmap_dir=colmap_dir,
         point_size=args.point_size,
         frustum_scale=args.frustum_scale,
+        z_positive=z_positive,
         verbose=args.verbose,
     )
     app.run()
