@@ -14,7 +14,7 @@ TRAIN_VIS_MODE="tensorboard"
 ########################################
 
 CAMERA_RES_SCALE_FACTOR=1
-MAX_RES=2048
+MAX_RES=4096
 NUM_DOWNSCALES=1
 SKIP_IMAGE_PROCESSING=true
 
@@ -22,11 +22,11 @@ SKIP_IMAGE_PROCESSING=true
 # TRAINING
 ########################################
 
-MAX_ITER=5000
+MAX_ITER=10000
 
 # Split autorisé jusqu'aux 2/3 de l'entraînement
 # → plus de temps pour combler les zones floues
-STOP_SPLIT_AT=3500
+STOP_SPLIT_AT=6000
 
 ########################################
 # LEARNING RATES

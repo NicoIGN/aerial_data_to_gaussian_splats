@@ -371,6 +371,7 @@ else
           ORIG_NUM_DOWNSCALES="${NUM_DOWNSCALES:-}"
           ORIG_REFINE_EVERY="$REFINE_EVERY"
           ORIG_STOP_SPLIT_AT="$STOP_SPLIT_AT"
+          ORIG_MAX_RES="$MAX_RES"
           ORIG_RELOAD_FROM_CHECKPOINT="${RELOAD_FROM_CHECKPOINT:-False}"
 
           # -----------------------------
@@ -379,6 +380,7 @@ else
           # -----------------------------
           CAMERA_RES_SCALE_FACTOR="0.5"
           NUM_DOWNSCALES="2"
+          MAX_RES="1024"
           RELOAD_FROM_CHECKPOINT="False"
 
           echo "🧩 Stage coarse: SCALE=$CAMERA_RES_SCALE_FACTOR DOWNSCALE=$NUM_DOWNSCALES"
@@ -429,12 +431,13 @@ else
           # Stage 2: FULL RES (1000 iters, no refine/split, resume)
           # -----------------------------
           MAX_ITER=$((ORIG_MAX_ITER + 1000))
+          STEPS_PER_SAVE="1000"
           CAMERA_RES_SCALE_FACTOR="$ORIG_CAMERA_RES_SCALE_FACTOR"
           NUM_DOWNSCALES="$ORIG_NUM_DOWNSCALES"
+          MAX_RES="$ORIG_MAX_RES"
           REFINE_EVERY="999999"
           STOP_SPLIT_AT="0"
           RELOAD_FROM_CHECKPOINT="True"
-          STEPS_PER_SAVE="1000"
 
           echo "🧩 Stage full: SCALE=$CAMERA_RES_SCALE_FACTOR DOWNSCALE=${NUM_DOWNSCALES:-<unset>} MAX_ITER=$MAX_ITER REFINE_EVERY=$REFINE_EVERY STOP_SPLIT_AT=$STOP_SPLIT_AT (resume)"
 
