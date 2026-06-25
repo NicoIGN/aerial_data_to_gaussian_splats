@@ -247,6 +247,7 @@ srun --unbuffered \
   --colmap-dir "$COLMAP_DIR" \
   --image-dir "$IMAGE_DIR" \
   --skip-conda \
+  --two-stages \
   ${SKIP_TRAINING:+--skip-training} \
   --gsplat-profile "$GSPLAT_PROFILE"
 
