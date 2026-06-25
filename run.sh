@@ -428,7 +428,7 @@ else
           # -----------------------------
           # Stage 2: FULL RES (1000 iters, no refine/split, resume)
           # -----------------------------
-          MAX_ITER="1000"
+          MAX_ITER=$((ORIG_MAX_ITER + 1000))
           CAMERA_RES_SCALE_FACTOR="$ORIG_CAMERA_RES_SCALE_FACTOR"
           NUM_DOWNSCALES="$ORIG_NUM_DOWNSCALES"
           REFINE_EVERY="999999"
@@ -480,7 +480,7 @@ else
           bash scripts/train.sh
 
           # restore (optionnel)
-          MAX_ITER=$((ORIG_MAX_ITER + 1000))
+          MAX_ITER="$ORIG_MAX_ITER"
           CAMERA_RES_SCALE_FACTOR="$ORIG_CAMERA_RES_SCALE_FACTOR"
           NUM_DOWNSCALES="$ORIG_NUM_DOWNSCALES"
           REFINE_EVERY="$ORIG_REFINE_EVERY"
