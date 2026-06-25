@@ -531,6 +531,7 @@ else
         fi
 
         print_step_time "TRAINING" "$STEP_START"
+    fi
 fi
 
 # ----------------------
