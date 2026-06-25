@@ -278,6 +278,7 @@ else
         LOAD_STEP=$(basename "$LAST_CKPT" | sed -E 's/^step-0*([0-9]+)\.ckpt$/\1/')
         echo "🔢 LOAD_STEP resolved to: $LOAD_STEP"
       fi
+  fi
 fi
 
 
