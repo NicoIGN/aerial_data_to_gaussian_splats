@@ -45,6 +45,8 @@ IGNORE_PROXY=false
 MAX_JOBS=2
 SKIP_TRAINING=false
 SKIP_EXPORT=false
+TWO_STAGES=false
+
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -70,6 +72,7 @@ Options:
   --name <name>              Base name of outputs (default: gsplat_<timestamp>)
   --gsplat-profile <name>    fast | balanced | quality | quality_plus
   --max-jobs <int>           Number of parallelizable jobs
+  --two-stages              Use two-stage training (coarse -> full resolution)
 
   --skip-conda               Skip conda environment setup
   --no-proxy                 Disable proxy configuration
@@ -100,6 +103,7 @@ while [[ $# -gt 0 ]]; do
     --no-proxy) IGNORE_PROXY=true; shift ;;
     --skip-training) SKIP_TRAINING=true; shift ;;
     --skip-export) SKIP_EXPORT=true; shift ;;
+    --two-stages) TWO_STAGES=true; shift ;;
     --help) show_help; exit 0 ;;
     *) echo "❌ Unknown param: $1"; show_help; exit 1 ;;
   esac
@@ -358,49 +362,104 @@ else
 
         STEP_START=$(date +%s)
 
-        HTTP_PROXY="$HTTP_PROXY" \
-        HTTPS_PROXY="$HTTPS_PROXY" \
-        NO_PROXY="$NO_PROXY" \
-        VERBOSE="True" \
-        RELOAD_FROM_CHECKPOINT="False" \
-        MODEL="$MODEL" \
-        MODEL_IMPLEMENTATION="$MODEL_IMPLEMENTATION" \
-        DEVICE="$DEVICE" \
-        MAX_ITER="$MAX_ITER" \
-        REFINE_EVERY="$REFINE_EVERY" \
-        MAX_JOBS="$MAX_JOBS" \
-        STEPS_PER_SAVE="$STEPS_PER_SAVE" \
-        STEPS_PER_EVAL_ALL_IMAGES="$STEPS_PER_EVAL_ALL_IMAGES" \
-        DATA="$COLMAP_DIR" \
-        EXPERIMENT_NAME="$EXPERIMENT_NAME" \
-        OUTPUTDIR="$TRAIN_DIR" \
-        TRAIN_RAYS_PER_BATCH="$TRAIN_RAYS_PER_BATCH" \
-        CAMERA_RES_SCALE_FACTOR="$CAMERA_RES_SCALE_FACTOR" \
-        NUM_NERF_SAMPLES_PER_RAY="$NUM_NERF_SAMPLES_PER_RAY" \
-        NUM_PROPOSAL_SAMPLES_PER_RAY="$NUM_PROPOSAL_SAMPLES_PER_RAY" \
-        MAX_RES="$MAX_RES" \
-        MAX_GAUSS_RATIO="$MAX_GAUSS_RATIO" \
-        DENSIFY_GRAD_THRESH="$DENSIFY_GRAD_THRESH" \
-        CULL_ALPHA_THRESH="$CULL_ALPHA_THRESH" \
-        CULL_SCREEN_SIZE="$CULL_SCREEN_SIZE" \
-        SPLIT_SCREEN_SIZE="$SPLIT_SCREEN_SIZE" \
-        STOP_SPLIT_AT="$STOP_SPLIT_AT" \
-        CULL_SCALE_THRESH="$CULL_SCALE_THRESH" \
-        RESET_ALPHA_EVERY="$RESET_ALPHA_EVERY" \
-        USE_SCALE_REGULARIZATION="$USE_SCALE_REGULARIZATION" \
-        SSIM_LAMBDA="$SSIM_LAMBDA" \
-        MAX_GAUSSIANS="$MAX_GAUSSIANS" \
-        COLLIDER_NEAR="$COLLIDER_NEAR" \
-        COLLIDER_FAR="$COLLIDER_FAR" \
-        ENABLE_COLLIDER="$ENABLE_COLLIDER" \
-        USE_BILATERAL_GRID="$USE_BILATERAL_GRID" \
-        USE_DEFAULTS="False" \
-        MIXED_PRECISION="$MIXED_PRECISION" \
-        USE_GRAD_SCALER="$USE_GRAD_SCALER" \
-        bash scripts/train.sh
+        if [ "$TWO_STAGES" = true ]; then
+          echo "👉 two-stage mode enabled (coarse -> full)"
+
+          HTTP_PROXY="$HTTP_PROXY" \
+          HTTPS_PROXY="$HTTPS_PROXY" \
+          NO_PROXY="$NO_PROXY" \
+          VERBOSE="True" \
+          MODEL="$MODEL" \
+          MODEL_IMPLEMENTATION="$MODEL_IMPLEMENTATION" \
+          DEVICE="$DEVICE" \
+          MAX_JOBS="$MAX_JOBS" \
+          STEPS_PER_SAVE="$STEPS_PER_SAVE" \
+          STEPS_PER_EVAL_ALL_IMAGES="$STEPS_PER_EVAL_ALL_IMAGES" \
+          DATA="$COLMAP_DIR" \
+          EXPERIMENT_NAME="$EXPERIMENT_NAME" \
+          OUTPUTDIR="$TRAIN_DIR" \
+          NUM_NERF_SAMPLES_PER_RAY="$NUM_NERF_SAMPLES_PER_RAY" \
+          NUM_PROPOSAL_SAMPLES_PER_RAY="$NUM_PROPOSAL_SAMPLES_PER_RAY" \
+          MAX_RES="$MAX_RES" \
+          MAX_GAUSS_RATIO="$MAX_GAUSS_RATIO" \
+          CULL_ALPHA_THRESH="$CULL_ALPHA_THRESH" \
+          CULL_SCREEN_SIZE="$CULL_SCREEN_SIZE" \
+          SPLIT_SCREEN_SIZE="$SPLIT_SCREEN_SIZE" \
+          CULL_SCALE_THRESH="$CULL_SCALE_THRESH" \
+          RESET_ALPHA_EVERY="$RESET_ALPHA_EVERY" \
+          USE_SCALE_REGULARIZATION="$USE_SCALE_REGULARIZATION" \
+          SSIM_LAMBDA="$SSIM_LAMBDA" \
+          MAX_GAUSSIANS="$MAX_GAUSSIANS" \
+          COLLIDER_NEAR="$COLLIDER_NEAR" \
+          COLLIDER_FAR="$COLLIDER_FAR" \
+          ENABLE_COLLIDER="$ENABLE_COLLIDER" \
+          USE_BILATERAL_GRID="$USE_BILATERAL_GRID" \
+          MIXED_PRECISION="$MIXED_PRECISION" \
+          USE_GRAD_SCALER="$USE_GRAD_SCALER" \
+          \
+          # Coarse stage
+          COARSE_MAX_ITER="${COARSE_MAX_ITER:-5000}" \
+          COARSE_CAMERA_RES_SCALE_FACTOR="${COARSE_CAMERA_RES_SCALE_FACTOR:-0.5}" \
+          COARSE_DOWNSCALE_FACTOR="${COARSE_DOWNSCALE_FACTOR:-2}" \
+          COARSE_TRAIN_RAYS_PER_BATCH="${COARSE_TRAIN_RAYS_PER_BATCH:-512}" \
+          COARSE_REFINE_EVERY="${COARSE_REFINE_EVERY:-300}" \
+          COARSE_DENSIFY_GRAD_THRESH="${COARSE_DENSIFY_GRAD_THRESH:-0.00045}" \
+          COARSE_STOP_SPLIT_AT="${COARSE_STOP_SPLIT_AT:-4000}" \
+          \
+          # Full stage
+          FULL_MAX_ITER="${FULL_MAX_ITER:-3000}" \
+          FULL_CAMERA_RES_SCALE_FACTOR="${FULL_CAMERA_RES_SCALE_FACTOR:-1.0}" \
+          FULL_DOWNSCALE_FACTOR="${FULL_DOWNSCALE_FACTOR:-1}" \
+          FULL_TRAIN_RAYS_PER_BATCH="${FULL_TRAIN_RAYS_PER_BATCH:-256}" \
+          FULL_REFINE_EVERY="${FULL_REFINE_EVERY:-500}" \
+          FULL_DENSIFY_GRAD_THRESH="${FULL_DENSIFY_GRAD_THRESH:-0.00060}" \
+          FULL_STOP_SPLIT_AT="${FULL_STOP_SPLIT_AT:-1500}" \
+          bash scripts/train_two_stage.sh
+
+        else
+          HTTP_PROXY="$HTTP_PROXY" \
+          HTTPS_PROXY="$HTTPS_PROXY" \
+          NO_PROXY="$NO_PROXY" \
+          VERBOSE="True" \
+          RELOAD_FROM_CHECKPOINT="False" \
+          MODEL="$MODEL" \
+          MODEL_IMPLEMENTATION="$MODEL_IMPLEMENTATION" \
+          DEVICE="$DEVICE" \
+          MAX_ITER="$MAX_ITER" \
+          REFINE_EVERY="$REFINE_EVERY" \
+          MAX_JOBS="$MAX_JOBS" \
+          STEPS_PER_SAVE="$STEPS_PER_SAVE" \
+          STEPS_PER_EVAL_ALL_IMAGES="$STEPS_PER_EVAL_ALL_IMAGES" \
+          DATA="$COLMAP_DIR" \
+          EXPERIMENT_NAME="$EXPERIMENT_NAME" \
+          OUTPUTDIR="$TRAIN_DIR" \
+          TRAIN_RAYS_PER_BATCH="$TRAIN_RAYS_PER_BATCH" \
+          CAMERA_RES_SCALE_FACTOR="$CAMERA_RES_SCALE_FACTOR" \
+          NUM_NERF_SAMPLES_PER_RAY="$NUM_NERF_SAMPLES_PER_RAY" \
+          NUM_PROPOSAL_SAMPLES_PER_RAY="$NUM_PROPOSAL_SAMPLES_PER_RAY" \
+          MAX_RES="$MAX_RES" \
+          MAX_GAUSS_RATIO="$MAX_GAUSS_RATIO" \
+          DENSIFY_GRAD_THRESH="$DENSIFY_GRAD_THRESH" \
+          CULL_ALPHA_THRESH="$CULL_ALPHA_THRESH" \
+          CULL_SCREEN_SIZE="$CULL_SCREEN_SIZE" \
+          SPLIT_SCREEN_SIZE="$SPLIT_SCREEN_SIZE" \
+          STOP_SPLIT_AT="$STOP_SPLIT_AT" \
+          CULL_SCALE_THRESH="$CULL_SCALE_THRESH" \
+          RESET_ALPHA_EVERY="$RESET_ALPHA_EVERY" \
+          USE_SCALE_REGULARIZATION="$USE_SCALE_REGULARIZATION" \
+          SSIM_LAMBDA="$SSIM_LAMBDA" \
+          MAX_GAUSSIANS="$MAX_GAUSSIANS" \
+          COLLIDER_NEAR="$COLLIDER_NEAR" \
+          COLLIDER_FAR="$COLLIDER_FAR" \
+          ENABLE_COLLIDER="$ENABLE_COLLIDER" \
+          USE_BILATERAL_GRID="$USE_BILATERAL_GRID" \
+          USE_DEFAULTS="False" \
+          MIXED_PRECISION="$MIXED_PRECISION" \
+          USE_GRAD_SCALER="$USE_GRAD_SCALER" \
+          bash scripts/train.sh
+        fi
 
         print_step_time "TRAINING" "$STEP_START"
-    fi
 fi
 
 # ----------------------
