@@ -45,6 +45,8 @@ IGNORE_PROXY=false
 MAX_JOBS=2
 SKIP_TRAINING=false
 SKIP_EXPORT=false
+TWO_STAGES=false
+
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -70,6 +72,7 @@ Options:
   --name <name>              Base name of outputs (default: gsplat_<timestamp>)
   --gsplat-profile <name>    fast | balanced | quality | quality_plus
   --max-jobs <int>           Number of parallelizable jobs
+  --two-stages              Use two-stage training (coarse -> full resolution)
 
   --skip-conda               Skip conda environment setup
   --no-proxy                 Disable proxy configuration
@@ -100,6 +103,7 @@ while [[ $# -gt 0 ]]; do
     --no-proxy) IGNORE_PROXY=true; shift ;;
     --skip-training) SKIP_TRAINING=true; shift ;;
     --skip-export) SKIP_EXPORT=true; shift ;;
+    --two-stages) TWO_STAGES=true; shift ;;
     --help) show_help; exit 0 ;;
     *) echo "❌ Unknown param: $1"; show_help; exit 1 ;;
   esac
@@ -350,7 +354,7 @@ else
 
     LATEST_RUN=$(ls -td "$OUTPUT_DIR"/ori/$MODEL/* 2>/dev/null | head -n 1 || true)
 
-     if [ -n "$LATEST_RUN" ] && [ -d "$LATEST_RUN/nerfstudio_models" ]; then
+    if [ -n "$LATEST_RUN" ] && [ -d "$LATEST_RUN/nerfstudio_models" ]; then
         echo "⏩ Skipping training"
     else
         echo ""
@@ -527,7 +531,7 @@ else
         fi
 
         print_step_time "TRAINING" "$STEP_START"
-    fi
+fi
 
 # ----------------------
 # EXPORT
