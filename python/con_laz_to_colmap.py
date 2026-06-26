@@ -739,10 +739,12 @@ def write_cameras_txt_single_camera(path: Path, width: int, height: int, fx: flo
 
 def write_images_txt(path: Path, frames, observations_by_image):
     with open(path, "w", encoding="utf-8") as f:
-        f.write("# Image list with two lines of data per image:\n")
-        f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
-        f.write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
-        f.write(f"# Number of images: {len(frames)}\n")
+        write = f.write
+
+        write("# Image list with two lines of data per image:\n")
+        write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
+        write(f"# Number of images: {len(frames)}\n")
 
         for fr in frames:
             q = fr["qvec"]
@@ -750,21 +752,19 @@ def write_images_txt(path: Path, frames, observations_by_image):
             image_id = fr["image_id"]
             camera_id = fr["camera_id"]
 
-            f.write(
-                f'{image_id} '
-                f'{q[0]:.12f} {q[1]:.12f} {q[2]:.12f} {q[3]:.12f} '
-                f'{t[0]:.12f} {t[1]:.12f} {t[2]:.12f} '
-                f'{camera_id} {fr["frame_name"]}\n'
+            write(
+                f"{image_id} "
+                f"{q[0]:.12f} {q[1]:.12f} {q[2]:.12f} {q[3]:.12f} "
+                f"{t[0]:.12f} {t[1]:.12f} {t[2]:.12f} "
+                f"{camera_id} {fr['frame_name']}\n"
             )
 
             obs = observations_by_image.get(image_id, [])
-            line = []
-            for o in obs:
-                x, y = o["xy"]
-                pid = o["point3d_id"]
-                line.append(f"{x:.6f} {y:.6f} {pid}")
-
-            f.write(" ".join(line) + "\n")
+            write(" ".join(
+                f"{o['xy'][0]:.6f} {o['xy'][1]:.6f} {o['point3d_id']}"
+                for o in obs
+            ))
+            write("\n")
 
 
 def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None, tracks_by_point=None, point3d_ids=None, verbose=1):

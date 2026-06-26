@@ -23,7 +23,8 @@ unset SLURM_CPUS_PER_TASK
 # =========================
 # LOAD USER CONFIG
 # =========================
-source config.sh
+echo CONFIG_SH: $CONFIG_SH
+source $CONFIG_SH
 VERBOSE="${VERBOSE:-false}"
 
 # Expected variables in config.sh:

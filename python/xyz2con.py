@@ -107,6 +107,62 @@ def load_tp3d(tp_path: Path):
                 pass
     return d
 
+def load_colmap_camera_txt(camera_txt_path: Path):
+    """
+    Parse cameras.txt COLMAP.
+    Retourne dict:
+      {
+        "camera_id": int,
+        "model": str,
+        "width": int,
+        "height": int,
+        "params": [float...]
+      }
+    """
+    cam = None
+    with open(camera_txt_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            p = s.split()
+            # CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]
+            if len(p) < 5:
+                continue
+            cam = {
+                "camera_id": int(p[0]),
+                "model": p[1],
+                "width": int(p[2]),
+                "height": int(p[3]),
+                "params": [float(x) for x in p[4:]]
+            }
+            break
+    if cam is None:
+        raise RuntimeError(f"Aucune caméra valide trouvée dans {camera_txt_path}")
+    return cam
+
+def camera_params_to_intrinsics(cam):
+    """
+    Support minimal: OPENCV
+    OPENCV params: fx fy cx cy k1 k2 p1 p2
+    """
+    model = cam["model"].upper()
+    prm = cam["params"]
+
+    if model == "OPENCV":
+        if len(prm) < 8:
+            raise ValueError("MODEL OPENCV requiert 8 params: fx fy cx cy k1 k2 p1 p2")
+        fx, fy, cx, cy, k1, k2, p1, p2 = prm[:8]
+        return {
+            "model": model,
+            "fx": fx, "fy": fy,
+            "cx": cx, "cy": cy,
+            "k1": k1, "k2": k2, "p1": p1, "p2": p2,
+            "width": cam["width"], "height": cam["height"]
+        }
+    else:
+        raise NotImplementedError(f"Model non supporté pour l'instant: {cam['model']}")
+
 
 # ========================= projection / stats =========================
 
@@ -366,7 +422,7 @@ def indent(elem, level=0):
 
 def fmt(v, n=12): return f"{float(v):.{n}f}"
 
-def build_con(row, ppa_c, ppa_l, width, height, domega, dphi, order, conv_rot="rx180", image2ground=True):
+def build_con(row, ppa_c, ppa_l, width, height, domega, dphi, order, conv_rot="rx180", image2ground=True, focale_override=None):
     R = apply_conv(
         opk_to_R(
             float(row["omega[deg]"]) + domega,
@@ -412,7 +468,8 @@ def build_con(row, ppa_c, ppa_l, width, height, domega, dphi, order, conv_rot="r
     ppa = ET.SubElement(sensor, "ppa")
     ET.SubElement(ppa, "c").text = fmt(ppa_c)
     ET.SubElement(ppa, "l").text = fmt(ppa_l)
-    ET.SubElement(ppa, "focale").text = fmt(row["c"])
+    foc = float(focale_override) if focale_override is not None else float(row["c"])
+    ET.SubElement(ppa, "focale").text = fmt(foc)
 
     return ET.ElementTree(root), Path(str(row["label"])).stem
 
@@ -424,6 +481,8 @@ def parse_args():
     ap.add_argument("--input", required=True)
     ap.add_argument("--images_dir", required=True)
     ap.add_argument("--output_dir", required=True)
+    ap.add_argument("--camera_txt", type=str, default=None,
+                    help="Chemin vers cameras.txt COLMAP (intrinsics figées). Si fourni, on n'estime pas les params caméra.")
     ap.add_argument("--obs_dir", required=True)
     ap.add_argument("--tp3d", required=True)
     ap.add_argument("--report_csv", default=None)
@@ -471,6 +530,15 @@ def run_optimisation(args):
     if "#label" in df.columns: df = df.rename(columns={"#label": "label"})
     if "intLabel" in df.columns: df = df.rename(columns={"intLabel": "label"})
 
+    fixed_cam = None
+    if args.camera_txt:
+        fixed_cam_raw = load_colmap_camera_txt(Path(args.camera_txt))
+        fixed_cam = camera_params_to_intrinsics(fixed_cam_raw)
+        print(f"[INFO] camera_txt chargé: model={fixed_cam['model']} "
+              f"{fixed_cam['width']}x{fixed_cam['height']} "
+              f"fx={fixed_cam['fx']:.3f} fy={fixed_cam['fy']:.3f} "
+              f"cx={fixed_cam['cx']:.3f} cy={fixed_cam['cy']:.3f} k1={fixed_cam['k1']:.6f}")
+
     # phase1 screening
     orders = ["RxRyRz", "RzRyRx"]
     convs = ["none", "rx180", "ry180", "rz180"]
@@ -500,78 +568,90 @@ def run_optimisation(args):
     print("\n[HYP] kept:")
     print(kept_df[["order","conv_rot","image2ground","y0_sign","med","rmse","p95","score"]].to_string(index=False))
 
-    # phase2 rapide: dc/dl/k1 only
-    fit = {
-        "coarse_r": {"dc": args.coarse_r_dc, "dl": args.coarse_r_dl, "k1": args.coarse_r_k1, "domega": 0.0, "dphi": 0.0},
-        "coarse_s": {"dc": 3, "dl": 3, "k1": 3, "domega": 1, "dphi": 1},
-        "ref1_r": {"dc": args.ref1_r_dc, "dl": args.ref1_r_dl, "k1": args.ref1_r_k1, "domega": 0.0, "dphi": 0.0},
-        "ref1_s": {"dc": 3, "dl": 3, "k1": 3, "domega": 1, "dphi": 1},
-        "ref2_r": {"dc": args.ref2_r_dc, "dl": args.ref2_r_dl, "k1": args.ref2_r_k1, "domega": 0.0, "dphi": 0.0},
-        "ref2_s": {"dc": 3, "dl": 3, "k1": 3, "domega": 1, "dphi": 1},
-    }
-
     final_rows, final_logs = [], []
     best_ref_score = None
 
-    for i, h in kept_df.iterrows():
-        print(f"\n[PHASE2] hypothesis {i+1}/{len(kept_df)} => {h['order']} {h['conv_rot']} i2g={h['image2ground']} y0={int(h['y0_sign'])}")
-        samples = build_samples(df, images_dir, obs_dir, int(h["y0_sign"]), args.fit_stride, args.fit_max_images)
-        cfg = {"order": str(h["order"]), "conv_rot": str(h["conv_rot"]), "image2ground": bool(h["image2ground"]), "z_positive": (not args.z_negative)}
+    if fixed_cam is None:
+        # phase2 rapide: dc/dl/k1 only
+        fit = {
+            "coarse_r": {"dc": args.coarse_r_dc, "dl": args.coarse_r_dl, "k1": args.coarse_r_k1, "domega": 0.0, "dphi": 0.0},
+            "coarse_s": {"dc": 3, "dl": 3, "k1": 3, "domega": 1, "dphi": 1},
+            "ref1_r": {"dc": args.ref1_r_dc, "dl": args.ref1_r_dl, "k1": args.ref1_r_k1, "domega": 0.0, "dphi": 0.0},
+            "ref1_s": {"dc": 3, "dl": 3, "k1": 3, "domega": 1, "dphi": 1},
+            "ref2_r": {"dc": args.ref2_r_dc, "dl": args.ref2_r_dl, "k1": args.ref2_r_k1, "domega": 0.0, "dphi": 0.0},
+            "ref2_s": {"dc": 3, "dl": 3, "k1": 3, "domega": 1, "dphi": 1},
+        }
 
-        best, logs, stage_bests = optimize_phase2(samples, tp3d, cfg, fit, use_input_ppa=args.use_input_ppa)
+        for i, h in kept_df.iterrows():
+            print(f"\n[PHASE2] hypothesis {i+1}/{len(kept_df)} => {h['order']} {h['conv_rot']} i2g={h['image2ground']} y0={int(h['y0_sign'])}")
+            samples = build_samples(df, images_dir, obs_dir, int(h["y0_sign"]), args.fit_stride, args.fit_max_images)
+            cfg = {"order": str(h["order"]), "conv_rot": str(h["conv_rot"]), "image2ground": bool(h["image2ground"]), "z_positive": (not args.z_negative)}
 
-        c = stage_bests["coarse"]
-        if best_ref_score is not None:
-            if (c["rmse"] > args.phase2_abs_abort_rmse) or (c["score"] > args.phase2_rel_abort * best_ref_score):
-                print(f"[PHASE2] ABORT hyp {i+1}: coarse too bad (rmse={c['rmse']:.1f}, score={c['score']:.1f})")
-                continue
+            best, logs, stage_bests = optimize_phase2(samples, tp3d, cfg, fit, use_input_ppa=args.use_input_ppa)
 
-        if best_ref_score is None or best["score"] < best_ref_score:
-            best_ref_score = best["score"]
+            c = stage_bests["coarse"]
+            if best_ref_score is not None:
+                if (c["rmse"] > args.phase2_abs_abort_rmse) or (c["score"] > args.phase2_rel_abort * best_ref_score):
+                    print(f"[PHASE2] ABORT hyp {i+1}: coarse too bad (rmse={c['rmse']:.1f}, score={c['score']:.1f})")
+                    continue
 
-        logs = logs.copy()
-        logs["order"] = h["order"]; logs["conv_rot"] = h["conv_rot"]; logs["image2ground"] = h["image2ground"]; logs["y0_sign"] = h["y0_sign"]
-        final_logs.append(logs)
+            if best_ref_score is None or best["score"] < best_ref_score:
+                best_ref_score = best["score"]
 
-        final_rows.append({
-            "order": h["order"], "conv_rot": h["conv_rot"], "image2ground": h["image2ground"], "y0_sign": int(h["y0_sign"]),
-            "dc": best["dc"], "dl": best["dl"], "k1": best["k1"], "domega": best["domega"], "dphi": best["dphi"],
-            "med": best["med"], "rmse": best["rmse"], "p95": best["p95"], "score": best["score"]
-        })
+            logs = logs.copy()
+            logs["order"] = h["order"]; logs["conv_rot"] = h["conv_rot"]; logs["image2ground"] = h["image2ground"]; logs["y0_sign"] = h["y0_sign"]
+            final_logs.append(logs)
 
-    final_df = pd.DataFrame(final_rows).sort_values("score").reset_index(drop=True)
-    if final_df.empty:
-        raise RuntimeError("Aucune hypothèse valide après phase2.")
+            final_rows.append({
+                "order": h["order"], "conv_rot": h["conv_rot"], "image2ground": h["image2ground"], "y0_sign": int(h["y0_sign"]),
+                "dc": best["dc"], "dl": best["dl"], "k1": best["k1"], "domega": best["domega"], "dphi": best["dphi"],
+                "med": best["med"], "rmse": best["rmse"], "p95": best["p95"], "score": best["score"]
+            })
 
-    best_row = final_df.iloc[0].to_dict()
+        final_df = pd.DataFrame(final_rows).sort_values("score").reset_index(drop=True)
+        if final_df.empty:
+            raise RuntimeError("Aucune hypothèse valide après phase2.")
 
-    # refine angulaire final
-    samples_best = build_samples(df, images_dir, obs_dir, int(best_row["y0_sign"]), args.fit_stride, args.fit_max_images)
-    cfg_best = {
-        "order": str(best_row["order"]),
-        "conv_rot": str(best_row["conv_rot"]),
-        "image2ground": bool(best_row["image2ground"]),
-        "z_positive": (not args.z_negative)
-    }
+        best_row = final_df.iloc[0].to_dict()
 
-    ang_best, ang_logs = optimize_domega_dphi_final(
-        samples=samples_best, tp3d=tp3d, cfg=cfg_best,
-        fixed_params={"dc": float(best_row["dc"]), "dl": float(best_row["dl"]), "k1": float(best_row["k1"])},
-        use_input_ppa=args.use_input_ppa
-    )
+        # refine angulaire final
+        samples_best = build_samples(df, images_dir, obs_dir, int(best_row["y0_sign"]), args.fit_stride, args.fit_max_images)
+        cfg_best = {
+            "order": str(best_row["order"]),
+            "conv_rot": str(best_row["conv_rot"]),
+            "image2ground": bool(best_row["image2ground"]),
+            "z_positive": (not args.z_negative)
+        }
 
-    ang_top3 = ang_logs.sort_values("score").head(3).copy()
-    print("\n[ANG] top3:")
-    print(ang_top3[["stage","domega","dphi","med","rmse","p95","score"]].to_string(index=False))
+        ang_best, ang_logs = optimize_domega_dphi_final(
+            samples=samples_best, tp3d=tp3d, cfg=cfg_best,
+            fixed_params={"dc": float(best_row["dc"]), "dl": float(best_row["dl"]), "k1": float(best_row["k1"])},
+            use_input_ppa=args.use_input_ppa
+        )
 
-    best_row["domega"] = float(ang_best["domega"])
-    best_row["dphi"] = float(ang_best["dphi"])
-    best_row["med"] = float(ang_best["med"])
-    best_row["rmse"] = float(ang_best["rmse"])
-    best_row["p95"] = float(ang_best["p95"])
-    best_row["score"] = float(ang_best["score"])
+        ang_top3 = ang_logs.sort_values("score").head(3).copy()
+        print("\n[ANG] top3:")
+        print(ang_top3[["stage","domega","dphi","med","rmse","p95","score"]].to_string(index=False))
 
-    print(f"[FINAL+ANG] dc={best_row['dc']:.3f} dl={best_row['dl']:.3f} k1={best_row['k1']:.6f} dω={best_row['domega']:.4f} dφ={best_row['dphi']:.4f} rmse={best_row['rmse']:.2f}")
+        best_row["domega"] = float(ang_best["domega"])
+        best_row["dphi"] = float(ang_best["dphi"])
+        best_row["med"] = float(ang_best["med"])
+        best_row["rmse"] = float(ang_best["rmse"])
+        best_row["p95"] = float(ang_best["p95"])
+        best_row["score"] = float(ang_best["score"])
+
+        print(f"[FINAL+ANG] dc={best_row['dc']:.3f} dl={best_row['dl']:.3f} k1={best_row['k1']:.6f} dω={best_row['domega']:.4f} dφ={best_row['dphi']:.4f} rmse={best_row['rmse']:.2f}")
+    else:
+        # Intrinsics figées via camera_txt: pas d'estimation dc/dl/k1
+        h = kept_df.iloc[0]
+        best_row = {
+            "order": h["order"], "conv_rot": h["conv_rot"], "image2ground": bool(h["image2ground"]), "y0_sign": int(h["y0_sign"]),
+            "dc": 0.0, "dl": 0.0, "k1": float(fixed_cam["k1"]),
+            "domega": 0.0, "dphi": 0.0,
+            "med": float(h["med"]), "rmse": float(h["rmse"]), "p95": float(h["p95"]), "score": float(h["score"])
+        }
+        final_df = pd.DataFrame([best_row])
+        print("[INFO] camera_txt fourni => optimisation intrinsics (dc/dl/k1) désactivée.")
 
     return {
         "args": args,
@@ -583,7 +663,8 @@ def run_optimisation(args):
         "hyp_df": hyp_df,
         "final_df": final_df,
         "best_row": best_row,
-        "final_logs": final_logs
+        "final_logs": final_logs,
+        "fixed_cam": fixed_cam
     }
 
 
@@ -600,6 +681,7 @@ def export_best_hyp(result):
     final_df = result["final_df"]
     best_row = result["best_row"]
     final_logs = result["final_logs"]
+    fixed_cam = result.get("fixed_cam", None)
 
     print("\n[FINAL]")
     print(pd.DataFrame([best_row]).to_string(index=False))
@@ -624,15 +706,24 @@ def export_best_hyp(result):
         with Image.open(jpg) as im:
             w, h = im.size
 
-        base_cx = float(row["x0"]) if args.use_input_ppa else w/2.0
-        base_cy = float(best_row["y0_sign"]) * float(row["y0"]) if args.use_input_ppa else h/2.0
-        ppa_c = base_cx + float(best_row["dc"])
-        ppa_l = base_cy + float(best_row["dl"])
+        if fixed_cam is not None:
+            ppa_c = float(fixed_cam["cx"])
+            ppa_l = float(fixed_cam["cy"])
+            k1_val = float(fixed_cam["k1"])
+            foc_override = 0.5 * (float(fixed_cam["fx"]) + float(fixed_cam["fy"]))  # CON n'a qu'une focale
+        else:
+            base_cx = float(row["x0"]) if args.use_input_ppa else w/2.0
+            base_cy = float(best_row["y0_sign"]) * float(row["y0"]) if args.use_input_ppa else h/2.0
+            ppa_c = base_cx + float(best_row["dc"])
+            ppa_l = base_cy + float(best_row["dl"])
+            k1_val = float(best_row["k1"])
+            foc_override = None
 
         tree, img_name = build_con(
             row, ppa_c, ppa_l, w, h,
             float(best_row["domega"]), float(best_row["dphi"]),
-            cfg_best["order"], cfg_best["conv_rot"], cfg_best["image2ground"]
+            cfg_best["order"], cfg_best["conv_rot"], cfg_best["image2ground"],
+            focale_override=foc_override
         )
         indent(tree.getroot())
         tree.write(out_dir / f"{img_name}.CON", encoding="utf-8", xml_declaration=True)
@@ -655,9 +746,9 @@ def export_best_hyp(result):
                     proj = project_point(
                         xyz[0], xyz[1], xyz[2],
                         float(row["X0"]), float(row["Y0"]), float(row["Z0"]),
-                        R, ppa_c, ppa_l, float(row["c"]), w, h,
+                        R, ppa_c, ppa_l, float(row["c"]) if foc_override is None else float(foc_override), w, h,
                         image2ground=cfg_best["image2ground"], z_positive=cfg_best["z_positive"],
-                        k1=float(best_row["k1"])
+                        k1=k1_val
                     )
                     if proj is None:
                         behind += 1
