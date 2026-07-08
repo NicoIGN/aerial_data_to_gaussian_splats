@@ -44,6 +44,10 @@ except ImportError:
 
 IMAGE_EXTS = {".jp2", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
+# Rotation propre qui convertit un repère caméra "optique = -Z"
+# vers un repère caméra "optique = +Z" compatible avec l'inspector
+S_INSPECTOR = np.diag([1.0, -1.0, -1.0])
+
 
 def log(msg: str, level: int, verbose: int):
     if verbose >= level:
@@ -225,24 +229,6 @@ def build_R_i2g(omega_deg, phi_deg, kappa_deg):
     return Rx(d2r(float(omega_deg))) @ Ry(d2r(float(phi_deg))) @ Rz(d2r(float(kappa_deg)))
 
 
-def apply_camera_frame_transform(R_cw_raw, mode):
-    if mode == "raw":
-        return R_cw_raw.copy()
-    if mode == "flip_x":
-        return R_cw_raw @ np.diag([-1.0, 1.0, 1.0])
-    if mode == "flip_y":
-        return R_cw_raw @ np.diag([1.0, -1.0, 1.0])
-    if mode == "flip_z":
-        return R_cw_raw @ np.diag([1.0, 1.0, -1.0])
-    if mode == "flip_xy":
-        return R_cw_raw @ np.diag([-1.0, -1.0, 1.0])
-    if mode == "flip_xz":
-        return R_cw_raw @ np.diag([-1.0, 1.0, -1.0])
-    if mode == "flip_yz":
-        return R_cw_raw @ np.diag([1.0, -1.0, -1.0])
-    raise ValueError(f"Unknown camera frame mode: {mode}")
-
-
 def robust_stats(v):
     v = np.asarray(v, dtype=np.float64)
     return {
@@ -297,10 +283,9 @@ def distort_brown(x, y, p):
     return xd, yd
 
 
-def build_calibration_dataset(eors_df, tp3d, obs_dir, camera_frame_mode, max_points_per_image=100, verbose=1):
+def build_calibration_dataset(eors_df, tp3d, obs_dir, max_points_per_image=100):
     rows = []
     kept_labels = set()
-    ignored_images = []
 
     for row in eors_df.itertuples(index=False):
         label = str(row.label)
@@ -308,27 +293,22 @@ def build_calibration_dataset(eors_df, tp3d, obs_dir, camera_frame_mode, max_poi
         obs_path = Path(obs_dir) / f"{stem}_obs.txt"
 
         if not obs_path.exists():
-            ignored_images.append((stem, "obs file missing"))
             continue
 
         obs_rows = parse_obs_file(obs_path, max_points_per_image=max_points_per_image)
         if not obs_rows:
-            ignored_images.append((stem, "obs file empty"))
             continue
 
         C = np.array([float(row.X0), float(row.Y0), float(row.Z0)], dtype=np.float64)
         R_i2g = build_R_i2g(row.omega_deg, row.phi_deg, row.kappa_deg)
-        R_cw_raw = R_i2g.T
-        R_cw = apply_camera_frame_transform(R_cw_raw, camera_frame_mode)
+        R_cw = R_i2g.T
         tvec = -R_cw @ C
 
         kept_for_image = 0
-        rejected_for_image = 0
 
         for pid, c_obs, l_obs in obs_rows:
             xyz = tp3d.get(pid)
             if xyz is None:
-                rejected_for_image += 1
                 continue
 
             xyz = np.asarray(xyz, dtype=np.float64)
@@ -336,7 +316,6 @@ def build_calibration_dataset(eors_df, tp3d, obs_dir, camera_frame_mode, max_poi
             z = -float(Xc[2])
 
             if z <= 1e-12:
-                rejected_for_image += 1
                 continue
 
             x = float(Xc[0] / z)
@@ -353,17 +332,14 @@ def build_calibration_dataset(eors_df, tp3d, obs_dir, camera_frame_mode, max_poi
             })
             kept_for_image += 1
 
-        if kept_for_image == 0:
-            ignored_images.append((stem, f"outside LAZ extent / no valid homologous points (rejected={rejected_for_image})"))
-            continue
-
-        kept_labels.add(label)
+        if kept_for_image > 0:
+            kept_labels.add(label)
 
     df = pd.DataFrame(rows)
     if len(df) == 0:
         raise RuntimeError("Aucune observation exploitable pour la calibration après filtrage par emprise LAZ.")
 
-    return df, kept_labels, ignored_images
+    return df, kept_labels
 
 
 def predict_brown(df, p):
@@ -539,28 +515,65 @@ def filter_xy_bbox(xyz: np.ndarray, rgb: np.ndarray | None, xmin=None, xmax=None
     return xyz2, rgb2
 
 
-def project_point_brown(R_cw, t_cw, intr, xyz, z_positive):
-    Xc = R_cw @ xyz + t_cw
+def convert_intrinsics_direct_to_indirect(intr):
+    out = dict(intr)
+    out["cy"] = float(intr["height"]) - float(intr["cy"])
+    return out
+
+
+def convert_direct_obs_to_colmap_obs(c, l, height):
+    return float(c), float(height) - float(l)
+
+
+def convert_pose_internal_to_inspector(R_cw_internal, t_internal):
+    R_cw_export = S_INSPECTOR @ R_cw_internal
+    t_export = S_INSPECTOR @ t_internal
+    return R_cw_export, t_export
+
+
+def project_point_internal_direct(R_cw_internal, t_internal, intr_internal, xyz):
+    Xc = R_cw_internal @ xyz + t_internal
     z_raw = float(Xc[2])
 
-    if z_positive:
-        if z_raw <= 1e-9:
-            return None
-        z = z_raw
-    else:
-        if z_raw >= -1e-9:
-            return None
-        z = -z_raw
+    if z_raw >= -1e-9:
+        return None
 
+    z = -z_raw
     x = Xc[0] / z
     y = Xc[1] / z
-    xd, yd = distort_brown(x, y, intr)
-    u = intr["fx"] * xd + intr["cx"]
-    v = intr["fy"] * yd + intr["cy"]
-    return np.array([u, v], dtype=np.float64), z
+    xd, yd = distort_brown(x, y, intr_internal)
+
+    u = intr_internal["fx"] * xd + intr_internal["cx"]
+    v = intr_internal["fy"] * yd + intr_internal["cy"]
+
+    return {
+        "uv_direct": np.array([u, v], dtype=np.float64),
+        "Xc_internal": Xc.copy(),
+        "depth_internal": z,
+    }
 
 
-def build_frames_from_eors(eors_df, image_index, kept_labels, intr_scaled, camera_frame_mode, verbose=1):
+def project_point_export_colmap(R_cw_internal, t_internal, intr_internal, intr_export, xyz):
+    proj = project_point_internal_direct(R_cw_internal, t_internal, intr_internal, xyz)
+    if proj is None:
+        return None
+
+    u_dir, v_dir = proj["uv_direct"]
+    u_col = float(u_dir)
+    v_col = float(intr_export["height"] - v_dir)
+
+    R_cw_export, t_export = convert_pose_internal_to_inspector(R_cw_internal, t_internal)
+    Xc_export = R_cw_export @ xyz + t_export
+
+    return {
+        "uv": np.array([u_col, v_col], dtype=np.float64),
+        "Xc_export": Xc_export,
+        "Xc_internal": proj["Xc_internal"],
+        "depth_internal": proj["depth_internal"],
+    }
+
+
+def build_frames_from_eors(eors_df, image_index, kept_labels, verbose=1):
     frames = []
 
     for row in eors_df.itertuples(index=False):
@@ -574,20 +587,20 @@ def build_frames_from_eors(eors_df, image_index, kept_labels, intr_scaled, camer
         center = np.array([float(row.X0), float(row.Y0), float(row.Z0)], dtype=np.float64)
         R_i2g = build_R_i2g(row.omega_deg, row.phi_deg, row.kappa_deg)
 
-        R_cw_raw = R_i2g.T
-        R_cw_proj = apply_camera_frame_transform(R_cw_raw, camera_frame_mode)
+        R_cw_internal = R_i2g.T
+        t_internal = -R_cw_internal @ center
 
-        # Convention finale unique : caméra vers le bas
-        R_cw_final = R_cw_proj @ np.diag([1.0, -1.0, -1.0])
-        tvec_final = -R_cw_final @ center
+        R_cw_export, t_export = convert_pose_internal_to_inspector(R_cw_internal, t_internal)
 
-        det_final = float(np.linalg.det(R_cw_final))
-        if det_final <= 0:
-            log(f"[WARN] Rotation finale invalide pour {stem}, det={det_final}", 1, verbose)
-            continue
+        det_internal = float(np.linalg.det(R_cw_internal))
+        det_export = float(np.linalg.det(R_cw_export))
+        if abs(det_internal - 1.0) > 1e-6:
+            log(f"[WARN] Rotation interne inattendue pour {stem}, det={det_internal}", 1, verbose)
+        if abs(det_export - 1.0) > 1e-6:
+            log(f"[WARN] Rotation export inattendue pour {stem}, det={det_export}", 1, verbose)
 
-        rot_final = R.from_matrix(R_cw_final)
-        qx, qy, qz, qw = rot_final.as_quat()
+        rot = R.from_matrix(R_cw_export)
+        qx, qy, qz, qw = rot.as_quat()
         qvec = np.array([qw, qx, qy, qz], dtype=np.float64)
 
         frames.append({
@@ -596,22 +609,240 @@ def build_frames_from_eors(eors_df, image_index, kept_labels, intr_scaled, camer
             "frame_name": None,
             "source_stem": stem,
             "source_image": str(src_img),
-            "center": center,
+            "center_eors": center,
             "qvec": qvec,
-            "tvec": tvec_final,
-            "R_cw": R_cw_final,
-            "width": intr_scaled["width"],
-            "height": intr_scaled["height"],
-            "fx": intr_scaled["fx"],
-            "fy": intr_scaled["fy"],
-            "cx": intr_scaled["cx"],
-            "cy": intr_scaled["cy"],
+            "tvec": t_export,
+            "R_cw": R_cw_export,
+            "R_cw_internal": R_cw_internal,
+            "t_internal": t_internal,
         })
 
     return frames
 
 
-def build_synthetic_observations(frames, pts_xyz, intr, num_terrain_points=None, verbose=1):
+def debug_trace_camera_centers(frames, verbose=1, max_images=10):
+    log("[DEBUG-CENTER] Vérification des centres caméra exportés", 1, verbose)
+    log("[DEBUG-CENTER] Formule: C_back = -R_cw^T * tvec", 1, verbose)
+
+    if not frames:
+        log("[DEBUG-CENTER] aucune frame", 1, verbose)
+        return
+
+    dx_all = []
+    dy_all = []
+    dz_all = []
+
+    for fr in frames[:max_images]:
+        R_cw = np.asarray(fr["R_cw"], dtype=np.float64)
+        tvec = np.asarray(fr["tvec"], dtype=np.float64).reshape(3)
+        C_eors = np.asarray(fr["center_eors"], dtype=np.float64).reshape(3)
+
+        C_back = -R_cw.T @ tvec
+        delta = C_back - C_eors
+
+        dx_all.append(delta[0])
+        dy_all.append(delta[1])
+        dz_all.append(delta[2])
+
+        log(
+            f"[DEBUG-CENTER][{fr['source_stem']}] "
+            f"EORS=({C_eors[0]:.3f}, {C_eors[1]:.3f}, {C_eors[2]:.3f}) "
+            f"C_back=({C_back[0]:.3f}, {C_back[1]:.3f}, {C_back[2]:.3f}) "
+            f"d=({delta[0]:.6f}, {delta[1]:.6f}, {delta[2]:.6f}) "
+            f"tvec=({tvec[0]:.3f}, {tvec[1]:.3f}, {tvec[2]:.3f})",
+            1,
+            verbose,
+        )
+
+    dx_all = np.asarray(dx_all, dtype=np.float64)
+    dy_all = np.asarray(dy_all, dtype=np.float64)
+    dz_all = np.asarray(dz_all, dtype=np.float64)
+
+    log(
+        f"[DEBUG-CENTER][GLOBAL] "
+        f"dx mean={float(np.mean(dx_all)):.6f} maxabs={float(np.max(np.abs(dx_all))):.6f} | "
+        f"dy mean={float(np.mean(dy_all)):.6f} maxabs={float(np.max(np.abs(dy_all))):.6f} | "
+        f"dz mean={float(np.mean(dz_all)):.6f} maxabs={float(np.max(np.abs(dz_all))):.6f}",
+        1,
+        verbose,
+    )
+
+
+def debug_trace_camera_downward(frames, verbose=1, max_images=10):
+    log("[DEBUG-DOWN] Vérification de l'axe optique MONDE après conversion inspector", 1, verbose)
+    log("[DEBUG-DOWN] L'inspector dessine sur +Z caméra, donc axe optique monde test = R_wc_export @ [0,0,+1]", 1, verbose)
+
+    if not frames:
+        log("[DEBUG-DOWN] aucune frame", 1, verbose)
+        return
+
+    up_count = 0
+    down_count = 0
+
+    for fr in frames[:max_images]:
+        R_cw = np.asarray(fr["R_cw"], dtype=np.float64)
+        R_wc = R_cw.T
+        optical_world = R_wc @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        optical_world = optical_world / max(np.linalg.norm(optical_world), 1e-15)
+
+        down_ref = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        score_down = float(np.dot(optical_world, down_ref))
+        looks_up = optical_world[2] > 0.0
+
+        if looks_up:
+            up_count += 1
+        else:
+            down_count += 1
+
+        angle_down = math.degrees(math.acos(np.clip(score_down, -1.0, 1.0)))
+
+        log(
+            f"[DEBUG-DOWN][{fr['source_stem']}] "
+            f"optical_world=({optical_world[0]:.6f}, {optical_world[1]:.6f}, {optical_world[2]:.6f}) "
+            f"score_down={score_down:.6f} angle_down_deg={angle_down:.3f} "
+            f"looks_up={looks_up}",
+            1,
+            verbose,
+        )
+
+    log(
+        f"[DEBUG-DOWN][GLOBAL] looks_down_or_horizontal={down_count} looks_up={up_count}",
+        1,
+        verbose,
+    )
+
+
+def debug_validate_colmap_formula_on_observations(eors_df, image_index, tp3d, frames, intr_internal, intr_export,
+                                                  verbose=1, max_images=10, max_points_per_image=100):
+    frame_by_stem = {fr["source_stem"]: fr for fr in frames}
+
+    log("[DEBUG-COLMAP] Vérification formule export + poses inspector sur observations", 1, verbose)
+    log("[DEBUG-COLMAP] source obs: repère direct ; export image: repère indirect", 1, verbose)
+    log("[DEBUG-COLMAP] pose export: rotation 180° autour de X pour compatibilité inspector", 1, verbose)
+
+    shown = 0
+    global_err = []
+    global_dc = []
+    global_dl = []
+    global_positive_z = 0
+    global_visible = 0
+
+    for row in eors_df.itertuples(index=False):
+        stem = Path(str(row.label)).stem
+
+        if stem not in image_index or stem not in frame_by_stem:
+            continue
+
+        obs_path = Path(image_index[stem]).parent / f"{stem}_obs.txt"
+        if not obs_path.exists():
+            continue
+
+        obs_rows = parse_obs_file(obs_path, max_points_per_image=max_points_per_image)
+        if not obs_rows:
+            continue
+
+        fr = frame_by_stem[stem]
+        R_cw_internal = fr["R_cw_internal"]
+        t_internal = fr["t_internal"]
+
+        dc_all = []
+        dl_all = []
+        err_all = []
+        positive_z = 0
+        visible = 0
+        inside = 0
+
+        for pid, c_obs_direct, l_obs_direct in obs_rows:
+            xyz = tp3d.get(pid)
+            if xyz is None:
+                continue
+
+            xyz = np.asarray(xyz, dtype=np.float64)
+            proj = project_point_export_colmap(
+                R_cw_internal,
+                t_internal,
+                intr_internal,
+                intr_export,
+                xyz,
+            )
+            if proj is None:
+                continue
+
+            visible += 1
+
+            if proj["Xc_export"][2] > 0:
+                positive_z += 1
+
+            uv = proj["uv"]
+            c_obs_colmap, l_obs_colmap = convert_direct_obs_to_colmap_obs(
+                c_obs_direct, l_obs_direct, intr_export["height"]
+            )
+
+            if 0.0 <= uv[0] < intr_export["width"] and 0.0 <= uv[1] < intr_export["height"]:
+                inside += 1
+
+            dc = float(c_obs_colmap - uv[0])
+            dl = float(l_obs_colmap - uv[1])
+            err = math.sqrt(dc * dc + dl * dl)
+
+            dc_all.append(dc)
+            dl_all.append(dl)
+            err_all.append(err)
+
+        if len(err_all) == 0:
+            log(f"[DEBUG-COLMAP][{stem}] 0 projection valide", 1, verbose)
+            shown += 1
+            if shown >= max_images:
+                break
+            continue
+
+        dc_all = np.asarray(dc_all, dtype=np.float64)
+        dl_all = np.asarray(dl_all, dtype=np.float64)
+        err_all = np.asarray(err_all, dtype=np.float64)
+
+        global_err.extend(err_all.tolist())
+        global_dc.extend(dc_all.tolist())
+        global_dl.extend(dl_all.tolist())
+        global_positive_z += positive_z
+        global_visible += visible
+
+        log(
+            f"[DEBUG-COLMAP][{stem}] valid={len(err_all)}/{len(obs_rows)} "
+            f"visible={visible} z_export_pos={positive_z} inside={inside} "
+            f"mean_err={float(np.mean(err_all)):.3f} "
+            f"med_err={float(np.median(err_all)):.3f} "
+            f"rmse={float(np.sqrt(np.mean(err_all ** 2))):.3f} "
+            f"mean_dc={float(np.mean(dc_all)):.3f} "
+            f"mean_dl={float(np.mean(dl_all)):.3f}",
+            1,
+            verbose,
+        )
+
+        shown += 1
+        if shown >= max_images:
+            break
+
+    if len(global_err) > 0:
+        global_err = np.asarray(global_err, dtype=np.float64)
+        global_dc = np.asarray(global_dc, dtype=np.float64)
+        global_dl = np.asarray(global_dl, dtype=np.float64)
+
+        log(
+            f"[DEBUG-COLMAP][GLOBAL] n={len(global_err)} "
+            f"visible={global_visible} z_export_pos={global_positive_z} "
+            f"mean_err={float(np.mean(global_err)):.3f} "
+            f"med_err={float(np.median(global_err)):.3f} "
+            f"rmse={float(np.sqrt(np.mean(global_err ** 2))):.3f} "
+            f"mean_dc={float(np.mean(global_dc)):.3f} "
+            f"mean_dl={float(np.mean(global_dl)):.3f}",
+            1,
+            verbose,
+        )
+    else:
+        log("[DEBUG-COLMAP][GLOBAL] aucune projection valide", 1, verbose)
+
+
+def build_synthetic_observations(frames, pts_xyz, intr_internal, intr_export, num_terrain_points=None, verbose=1):
     num_pts_total = len(pts_xyz)
 
     if num_pts_total == 0:
@@ -638,7 +869,9 @@ def build_synthetic_observations(frames, pts_xyz, intr, num_terrain_points=None,
         1,
         verbose,
     )
-    log("  Convention finale exportée: caméra vers le bas, z_positive=True", 1, verbose)
+    log("  Convention interne: repère direct, visible si Zc<0", 1, verbose)
+    log("  Convention export image: repère indirect", 1, verbose)
+    log("  Convention export pose: +Z caméra vers l'avant pour l'inspector", 1, verbose)
 
     iterable = selected_indices
     use_tqdm = verbose >= 1 and tqdm is not None
@@ -650,27 +883,29 @@ def build_synthetic_observations(frames, pts_xyz, intr, num_terrain_points=None,
             unit="pt",
         )
 
-    width = intr["width"]
-    height = intr["height"]
+    width = intr_export["width"]
+    height = intr_export["height"]
 
     for pt_idx in iterable:
         xyz = pts_xyz[pt_idx]
         point3d_id = int(pt_idx + 1)
 
         for fr in frames:
-            proj = project_point_brown(
-                fr["R_cw"],
-                fr["tvec"],
-                intr,
+            proj = project_point_export_colmap(
+                fr["R_cw_internal"],
+                fr["t_internal"],
+                intr_internal,
+                intr_export,
                 xyz,
-                z_positive=True,
             )
-
             if proj is None:
                 continue
 
-            uv, _ = proj
-            u, v = uv
+            uv = proj["uv"]
+            u, v = float(uv[0]), float(uv[1])
+
+            if proj["Xc_export"][2] <= 0:
+                continue
 
             if not (0.0 <= u < width and 0.0 <= v < height):
                 continue
@@ -678,7 +913,7 @@ def build_synthetic_observations(frames, pts_xyz, intr, num_terrain_points=None,
             point2d_idx = len(observations_by_image[fr["image_id"]])
 
             observations_by_image[fr["image_id"]].append({
-                "xy": np.asarray(uv, dtype=np.float64),
+                "xy": np.asarray([u, v], dtype=np.float64),
                 "point3d_id": point3d_id,
             })
 
@@ -735,7 +970,8 @@ def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by
 
         observations_new = {}
         items = observations_by_image.items()
-        if verbose >= 1 and tqdm is not None:
+        use_tqdm = verbose >= 1 and tqdm is not None
+        if use_tqdm:
             items = tqdm(items, total=len(observations_by_image), desc="Remap observations", unit="img")
 
         for image_id, obs_list in items:
@@ -829,18 +1065,80 @@ def scale_camera_model(intr, factor):
     return out
 
 
+def prepare_selected_images(source_paths, output_dir: Path, factor: float, jpeg_quality: int,
+                            verbose: int, image_convertor_script: Path):
+    ensure_dir(output_dir)
+
+    if not image_convertor_script.exists():
+        raise FileNotFoundError(f"Script de conversion introuvable: {image_convertor_script}")
+
+    produced = {}
+
+    for src_path in source_paths:
+        src_path = Path(src_path)
+        stem = src_path.stem
+        ext = src_path.suffix.lower()
+
+        if ext in {".jp2", ".tif", ".tiff"}:
+            out_path = output_dir / f"{stem}.jpg"
+            output_mode = "--jpg"
+
+        elif ext in {".jpg", ".jpeg", ".png", ".bmp"}:
+            if factor <= 1.0:
+                out_path = output_dir / src_path.name
+                log(f"  Copie: {src_path.name}", 2, verbose)
+                shutil.copy2(src_path, out_path)
+                produced[stem] = out_path
+                continue
+
+            out_path = output_dir / src_path.name
+            if ext in {".jpg", ".jpeg"}:
+                output_mode = "--jpg"
+            elif ext == ".png":
+                output_mode = "--png"
+            elif ext == ".bmp":
+                output_mode = "--png"
+                out_path = output_dir / f"{stem}.png"
+            else:
+                output_mode = "--jpg"
+                out_path = output_dir / f"{stem}.jpg"
+        else:
+            log(f"[WARN] Format non géré ignoré: {src_path.name}", 2, verbose)
+            continue
+
+        cmd = [
+            sys.executable,
+            str(image_convertor_script),
+            "--input", str(src_path),
+            "--output", str(out_path),
+            "--factor", str(factor),
+            output_mode,
+            "--jpeg-quality", str(jpeg_quality),
+        ]
+
+        if verbose >= 1:
+            cmd.append("--verbose")
+
+        log(f"  Conversion: {src_path.name} -> {out_path.name}", 2, verbose)
+        subprocess.run(cmd, check=True)
+
+        if not out_path.exists():
+            raise FileNotFoundError(f"Image convertie introuvable après conversion: {out_path}")
+
+        produced[stem] = out_path
+
+    return produced
+
+
 def write_cameras_txt_opencv(path: Path, intr):
     with open(path, "w", encoding="utf-8") as f:
         f.write("# Camera list with one line of data per camera:\n")
-        f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
         f.write("# Number of cameras: 1\n")
         f.write(
-            "1 OPENCV "
-            f"{intr['width']} {intr['height']} "
-            f"{intr['fx']:.12f} {intr['fy']:.12f} "
-            f"{intr['cx']:.12f} {intr['cy']:.12f} "
-            f"{intr['k1']:.12e} {intr['k2']:.12e} "
-            f"{intr['p1']:.12e} {intr['p2']:.12e}\n"
+            f"1 OPENCV {intr['width']} {intr['height']} "
+            f"{intr['fx']:.15f} {intr['fy']:.15f} {intr['cx']:.15f} {intr['cy']:.15f} "
+            f"{intr['k1']:.17g} {intr['k2']:.17g} {intr['p1']:.17g} {intr['p2']:.17g}\n"
         )
 
 
@@ -848,10 +1146,13 @@ def write_images_txt(path: Path, frames, observations_by_image):
     with open(path, "w", encoding="utf-8") as f:
         write = f.write
 
+        total_obs = sum(len(observations_by_image.get(fr["image_id"], [])) for fr in frames)
+        mean_obs = total_obs / max(len(frames), 1)
+
         write("# Image list with two lines of data per image:\n")
-        write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
-        write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
-        write(f"# Number of images: {len(frames)}\n")
+        write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+        write(f"# Number of images: {len(frames)}, mean observations per image: {mean_obs}\n")
 
         for fr in frames:
             q = fr["qvec"]
@@ -861,14 +1162,14 @@ def write_images_txt(path: Path, frames, observations_by_image):
 
             write(
                 f"{image_id} "
-                f"{q[0]:.12f} {q[1]:.12f} {q[2]:.12f} {q[3]:.12f} "
-                f"{t[0]:.12f} {t[1]:.12f} {t[2]:.12f} "
+                f"{q[0]:.17g} {q[1]:.17g} {q[2]:.17g} {q[3]:.17g} "
+                f"{t[0]:.17g} {t[1]:.17g} {t[2]:.17g} "
                 f"{camera_id} {fr['frame_name']}\n"
             )
 
             obs = observations_by_image.get(image_id, [])
             write(" ".join(
-                f"{o['xy'][0]:.6f} {o['xy'][1]:.6f} {o['point3d_id']}"
+                f"{o['xy'][0]:.15f} {o['xy'][1]:.15f} {o['point3d_id']}"
                 for o in obs
             ))
             write("\n")
@@ -902,13 +1203,13 @@ def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None, tracks_by_point=None, 
         for pid, p, c, track in iterable:
             parts = [
                 str(int(pid)),
-                f"{p[0]:.12f}",
-                f"{p[1]:.12f}",
-                f"{p[2]:.12f}",
+                f"{p[0]:.17g}",
+                f"{p[1]:.17g}",
+                f"{p[2]:.17g}",
                 str(int(c[0])),
                 str(int(c[1])),
                 str(int(c[2])),
-                "0.0",
+                "0",
             ]
 
             for tr in track:
@@ -916,6 +1217,16 @@ def write_points3D_txt(path: Path, pts_xyz, pts_rgb=None, tracks_by_point=None, 
                 parts.append(str(tr["point2d_idx"]))
 
             f.write(" ".join(parts) + "\n")
+
+
+def get_nerfstudio_axis_transform_4x4():
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :4] = np.array([
+        [1.0,  0.0,  0.0, 0.0],
+        [0.0,  0.0,  1.0, 0.0],
+        [0.0, -1.0,  0.0, 0.0],
+    ], dtype=np.float64)
+    return T
 
 
 def apply_transform_to_points(xyz: np.ndarray, T4: np.ndarray, scale: float):
@@ -928,7 +1239,38 @@ def apply_transform_to_points(xyz: np.ndarray, T4: np.ndarray, scale: float):
     return xyz_t
 
 
-def build_transforms_json(path: Path, frames, intr, extra_c2w_right_multiply=None, applied_transform=None, applied_scale=None):
+def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None):
+    n = len(xyz)
+
+    if rgb is None:
+        rgb = np.full((n, 3), 200, dtype=np.uint8)
+    else:
+        rgb = np.asarray(rgb)
+        if rgb.dtype != np.uint8:
+            rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    xyz_out = np.asarray(xyz, dtype=np.float64)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {n}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+
+        for p, c in zip(xyz_out, rgb):
+            f.write(
+                f"{float(p[0]):.12f} {float(p[1]):.12f} {float(p[2]):.12f} "
+                f"{int(c[0])} {int(c[1])} {int(c[2])}\n"
+            )
+
+
+def build_transforms_json(path: Path, frames, intr, applied_transform=None, applied_scale=None):
     if not frames:
         raise ValueError("Aucune frame pour transforms.json")
 
@@ -964,12 +1306,6 @@ def build_transforms_json(path: Path, frames, intr, extra_c2w_right_multiply=Non
     if applied_scale is not None:
         data["applied_scale"] = float(applied_scale)
 
-    extra = None
-    if extra_c2w_right_multiply is not None:
-        extra = np.asarray(extra_c2w_right_multiply, dtype=np.float64)
-        if extra.shape != (4, 4):
-            raise ValueError("extra_c2w_right_multiply doit être 4x4")
-
     for fr in frames:
         R_cw = np.asarray(fr["R_cw"], dtype=np.float64)
         t_cw = np.asarray(fr["tvec"], dtype=np.float64).reshape(3, 1)
@@ -978,13 +1314,7 @@ def build_transforms_json(path: Path, frames, intr, extra_c2w_right_multiply=Non
         w2c = np.concatenate([w2c, np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float64)], axis=0)
 
         c2w = np.linalg.inv(w2c)
-
-        # Convention Nerfstudio depuis COLMAP
         c2w[0:3, 1:3] *= -1
-
-        # Correction visuelle supplémentaire uniquement viewer
-        if extra is not None:
-            c2w = c2w @ extra
 
         if applied_transform_4x4 is not None:
             c2w = applied_transform_4x4 @ c2w
@@ -1233,130 +1563,21 @@ def try_write_colmap_bin(sparse_dir: Path, verbose: int):
     except Exception as e:
         log(f"[WARN] Impossible de générer les .bin avec pycolmap: {e}", 1, verbose)
         return False
-        
-def get_visual_downward_transform_4x4():
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = np.diag([1.0, -1.0, -1.0])
-    return T
 
-def get_nerfstudio_axis_transform_4x4():
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :4] = np.array([
-        [1.0,  0.0,  0.0, 0.0],
-        [0.0,  0.0,  1.0, 0.0],
-        [0.0, -1.0,  0.0, 0.0],
-    ], dtype=np.float64)
-    return T
-        
-def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None):
-    n = len(xyz)
-
-    if rgb is None:
-        rgb = np.full((n, 3), 200, dtype=np.uint8)
-    else:
-        rgb = np.asarray(rgb)
-        if rgb.dtype != np.uint8:
-            rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-
-    xyz_out = np.asarray(xyz, dtype=np.float64)
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {n}\n")
-        f.write("property float x\n")
-        f.write("property float y\n")
-        f.write("property float z\n")
-        f.write("property uchar red\n")
-        f.write("property uchar green\n")
-        f.write("property uchar blue\n")
-        f.write("end_header\n")
-
-        for p, c in zip(xyz_out, rgb):
-            f.write(
-                f"{float(p[0]):.12f} {float(p[1]):.12f} {float(p[2]):.12f} "
-                f"{int(c[0])} {int(c[1])} {int(c[2])}\n"
-            )
-
-def prepare_selected_images(source_paths, output_dir: Path, factor: float, jpeg_quality: int,
-                            verbose: int, image_convertor_script: Path):
-    ensure_dir(output_dir)
-
-    if not image_convertor_script.exists():
-        raise FileNotFoundError(f"Script de conversion introuvable: {image_convertor_script}")
-
-    produced = {}
-
-    for src_path in source_paths:
-        src_path = Path(src_path)
-        stem = src_path.stem
-        ext = src_path.suffix.lower()
-
-        if ext in {".jp2", ".tif", ".tiff"}:
-            out_path = output_dir / f"{stem}.jpg"
-            output_mode = "--jpg"
-
-        elif ext in {".jpg", ".jpeg", ".png", ".bmp"}:
-            if factor <= 1.0:
-                out_path = output_dir / src_path.name
-                log(f"  Copie: {src_path.name}", 2, verbose)
-                shutil.copy2(src_path, out_path)
-                produced[stem] = out_path
-                continue
-
-            out_path = output_dir / src_path.name
-            if ext in {".jpg", ".jpeg"}:
-                output_mode = "--jpg"
-            elif ext == ".png":
-                output_mode = "--png"
-            elif ext == ".bmp":
-                output_mode = "--png"
-                out_path = output_dir / f"{stem}.png"
-            else:
-                output_mode = "--jpg"
-                out_path = output_dir / f"{stem}.jpg"
-        else:
-            log(f"[WARN] Format non géré ignoré: {src_path.name}", 2, verbose)
-            continue
-
-        cmd = [
-            sys.executable,
-            str(image_convertor_script),
-            "--input", str(src_path),
-            "--output", str(out_path),
-            "--factor", str(factor),
-            output_mode,
-            "--jpeg-quality", str(jpeg_quality),
-        ]
-
-        if verbose >= 1:
-            cmd.append("--verbose")
-
-        log(f"  Conversion: {src_path.name} -> {out_path.name}", 2, verbose)
-        subprocess.run(cmd, check=True)
-
-        if not out_path.exists():
-            raise FileNotFoundError(f"Image convertie introuvable après conversion: {out_path}")
-
-        produced[stem] = out_path
-
-    return produced
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Génère un modèle COLMAP cohérent depuis eors+tp3d+obs+laz, et une sortie viewer séparée avec caméras orientées vers le bas."
+        description="Génère un modèle COLMAP compatible avec l'inspector: image exportée en repère indirect et repère caméra converti pour regarder vers +Z côté viewer."
     )
     ap.add_argument("--eors", required=True, help="Fichier eors.txt")
     ap.add_argument("--tp3d", required=True, help="Fichier tp.txt")
     ap.add_argument("--laz", required=True, help="Fichier .LAZ")
     ap.add_argument("--images", required=True, help="Dossier des images source")
     ap.add_argument("--out", required=True, help="Dossier de sortie")
-    ap.add_argument("--subsample", type=int, default=10, help="Facteur de sous-échantillonnage initial du LAZ")
-    ap.add_argument("--image-factor", type=float, default=1.0,
-                    help="Facteur de sous-échantillonnage des images (2 = largeur/hauteur divisées par 2)")
-    ap.add_argument("--jpeg-quality", type=int, default=95, help="Qualité JPEG de sortie")
-    ap.add_argument("--num-terrain-points", type=int, default=5000,
-                    help="Nombre de points terrain à reprojeter dans toutes les images")
+    ap.add_argument("--subsample", type=int, default=10)
+    ap.add_argument("--image-factor", type=float, default=1.0)
+    ap.add_argument("--jpeg-quality", type=int, default=95)
+    ap.add_argument("--num-terrain-points", type=int, default=5000)
     ap.add_argument("--xmin", type=float, default=None)
     ap.add_argument("--xmax", type=float, default=None)
     ap.add_argument("--ymin", type=float, default=None)
@@ -1364,12 +1585,9 @@ def main():
     ap.add_argument("--max-points-per-image", type=int, default=100)
     ap.add_argument("--num-calib-iters", type=int, default=5)
     ap.add_argument("--pixel-size", type=float, default=4.52e-6)
-    ap.add_argument("--camera-frame", type=str, default="raw",
-                    choices=["raw", "flip_x", "flip_y", "flip_z", "flip_xy", "flip_xz", "flip_yz"])
     ap.add_argument("--remap", action="store_true")
-    ap.add_argument("--z-negative", action="store_true",
-                    help="Conserve la convention photogrammétrique valide: z<0 visible.")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--debug-max-images", type=int, default=10)
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2])
     args = ap.parse_args()
 
@@ -1390,27 +1608,25 @@ def main():
     out_colmap = out_dir / "colmap"
     out_sparse = out_colmap / "sparse" / "0"
     out_models_0 = out_sparse / "models" / "0"
-
     sparse_pc_ply = out_dir / "sparse_pc.ply"
     normalization_json = out_dir / "scene_normalization.json"
     intrinsics_json = out_dir / "estimated_brown_camera.json"
+    transforms_json = out_dir / "transforms.json"
 
-    transforms_colmap_like = out_dir / "transforms_colmap_like.json"
-    transforms_view_down = out_dir / "transforms_view_down.json"
-
-    z_positive = not args.z_negative
-    log(f"[CONFIG] z_positive={z_positive}", 1, args.verbose)
-    log(f"[CONFIG] camera_frame={args.camera_frame}", 1, args.verbose)
+    log("[CONFIG] Calibration interne conservée", 1, args.verbose)
+    log("[CONFIG] Coordonnées image source: repère direct", 1, args.verbose)
+    log("[CONFIG] Coordonnées image export COLMAP: repère indirect", 1, args.verbose)
+    log("[CONFIG] Conversion repère caméra 3D pour inspector: rotation 180° autour de X", 1, args.verbose)
 
     for d in [out_images, out_sparse, out_models_0]:
         ensure_dir(d)
 
-    log("[1/9] Indexation des images existantes...", 1, args.verbose)
+    log("[1/9] Indexation des images...", 1, args.verbose)
     image_index = build_image_index(images_dir)
-    log(f"  {len(image_index)} images indexées.", 1, args.verbose)
+    log(f"  {len(image_index)} images indexées", 1, args.verbose)
 
     if not image_index:
-        print("Aucune image compatible trouvée dans le dossier fourni.")
+        print("Aucune image compatible trouvée.")
         sys.exit(2)
 
     log("[2/9] Lecture eors + tp3d...", 1, args.verbose)
@@ -1419,7 +1635,7 @@ def main():
     log(f"  {len(eors_df)} orientations chargées", 1, args.verbose)
     log(f"  {len(tp3d)} points 3D chargés", 1, args.verbose)
 
-    log("[2b/9] Calcul de l'emprise XY du LAZ...", 1, args.verbose)
+    log("[2b/9] Emprise XY du LAZ...", 1, args.verbose)
     laz_bbox = compute_xy_bbox_from_laz(laz_path, stride=max(1, args.subsample))
 
     if args.xmin is not None:
@@ -1432,7 +1648,7 @@ def main():
         laz_bbox["ymax"] = min(laz_bbox["ymax"], float(args.ymax))
 
     log(
-        f"  LAZ bbox used for tp3d filtering: "
+        f"  bbox LAZ utilisée: "
         f"x=[{laz_bbox['xmin']:.3f}, {laz_bbox['xmax']:.3f}] "
         f"y=[{laz_bbox['ymin']:.3f}, {laz_bbox['ymax']:.3f}]",
         1,
@@ -1453,23 +1669,21 @@ def main():
         sys.exit(10)
 
     width, height, init_f_px = infer_image_size_and_initial_f(images_dir, pixel_size_m=args.pixel_size)
-    log(f"  Taille image inférée: {width}x{height}", 1, args.verbose)
+    log(f"  Taille image: {width}x{height}", 1, args.verbose)
     log(f"  Focale initiale: {init_f_px:.6f} px", 1, args.verbose)
 
-    log("[3/9] Construction du dataset de calibration...", 1, args.verbose)
-    calib_df, kept_labels, ignored_images = build_calibration_dataset(
+    log("[3/9] Dataset de calibration...", 1, args.verbose)
+    calib_df, kept_labels = build_calibration_dataset(
         eors_df=eors_df,
         tp3d=tp3d,
         obs_dir=images_dir,
-        camera_frame_mode=args.camera_frame,
         max_points_per_image=args.max_points_per_image,
-        verbose=args.verbose,
     )
     log(f"  {len(calib_df)} observations utilisables", 1, args.verbose)
     log(f"  {len(kept_labels)} image(s) conservée(s) pour la calibration", 1, args.verbose)
 
     log("[4/9] Estimation de la caméra Brown...", 1, args.verbose)
-    intr, calib_last = estimate_brown_camera(
+    intr_internal, calib_last = estimate_brown_camera(
         df=calib_df,
         width=width,
         height=height,
@@ -1477,56 +1691,50 @@ def main():
         num_iter=args.num_calib_iters,
     )
     calib_stats, _, _, _, _, _ = calib_last
-    intr["width"] = width
-    intr["height"] = height
+    intr_internal["width"] = width
+    intr_internal["height"] = height
 
-    print("\n[FINAL BROWN CAMERA]")
-    print(intr)
+    print("\n[FINAL BROWN CAMERA - INTERNAL]")
+    print(intr_internal)
     print("[FINAL CALIB RESIDUALS]")
     print(calib_stats["err"])
 
+    factor = max(float(args.image_factor), 1.0)
+    intr_internal_scaled = scale_camera_model(intr_internal, factor)
+    intr_export = convert_intrinsics_direct_to_indirect(intr_internal_scaled)
+
+    log(
+        f"[INFO] Conversion intrinsics direct -> indirect: cy {intr_internal_scaled['cy']:.6f} -> {intr_export['cy']:.6f}",
+        1,
+        args.verbose,
+    )
+
     with open(intrinsics_json, "w", encoding="utf-8") as f:
         json.dump({
-            "width": intr["width"],
-            "height": intr["height"],
-            "fx": intr["fx"],
-            "fy": intr["fy"],
-            "cx": intr["cx"],
-            "cy": intr["cy"],
-            "k1": intr["k1"],
-            "k2": intr["k2"],
-            "p1": intr["p1"],
-            "p2": intr["p2"],
-            "residuals": calib_stats["err"],
-            "colmap_projection_convention": {
-                "camera_frame": args.camera_frame,
-                "z_positive": False,
-                "formula": "standard",
-            }
+            "internal_camera_direct": intr_internal,
+            "internal_camera_direct_scaled": intr_internal_scaled,
+            "export_camera_indirect": intr_export,
+            "camera_space_conversion_for_inspector": S_INSPECTOR.tolist(),
+            "residuals_internal": calib_stats["err"],
         }, f, indent=2)
 
-    log("[5/9] Construction des poses depuis eors...", 1, args.verbose)
-    factor = max(float(args.image_factor), 1.0)
-    intr_scaled = scale_camera_model(intr, factor)
-
+    log("[5/9] Construction des poses...", 1, args.verbose)
     frames = build_frames_from_eors(
         eors_df=eors_df,
         image_index=image_index,
         kept_labels=kept_labels,
-        intr_scaled=intr_scaled,
-        camera_frame_mode=args.camera_frame,
         verbose=args.verbose,
     )
 
     if not frames:
-        print("Aucune image commune exploitable entre eors, images et emprise LAZ.")
+        print("Aucune image exploitable.")
         sys.exit(3)
 
     log(f"  {len(frames)} poses retenues", 1, args.verbose)
 
     log("[6/9] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
     pts_xyz_raw, pts_rgb = read_laz_points(laz_path, args.subsample)
-    log(f"  {len(pts_xyz_raw)} points conservés après sous-échantillonnage initial.", 1, args.verbose)
+    log(f"  {len(pts_xyz_raw)} points conservés après sous-échantillonnage initial", 1, args.verbose)
 
     bbox_enabled = any(v is not None for v in (args.xmin, args.xmax, args.ymin, args.ymax))
     if bbox_enabled:
@@ -1537,17 +1745,41 @@ def main():
             xmin=args.xmin, xmax=args.xmax,
             ymin=args.ymin, ymax=args.ymax,
         )
-        log(f"  {len(pts_xyz_raw)}/{before_bbox} points conservés dans la bbox.", 1, args.verbose)
+        log(f"  {len(pts_xyz_raw)}/{before_bbox} points conservés dans la bbox", 1, args.verbose)
 
     if len(pts_xyz_raw) == 0:
         print("Aucun point LAZ conservé après filtrage.")
         sys.exit(4)
 
-    log("[7/9] Génération des observations synthétiques COLMAP...", 1, args.verbose)
+    if args.debug:
+        debug_trace_camera_centers(
+            frames=frames,
+            verbose=args.verbose,
+            max_images=args.debug_max_images,
+        )
+        debug_trace_camera_downward(
+            frames=frames,
+            verbose=args.verbose,
+            max_images=args.debug_max_images,
+        )
+        debug_validate_colmap_formula_on_observations(
+            eors_df=eors_df,
+            image_index=image_index,
+            tp3d=tp3d,
+            frames=frames,
+            intr_internal=intr_internal_scaled,
+            intr_export=intr_export,
+            verbose=args.verbose,
+            max_images=args.debug_max_images,
+            max_points_per_image=args.max_points_per_image,
+        )
+
+    log("[7/9] Génération des observations synthétiques...", 1, args.verbose)
     observations_by_image, tracks_by_point = build_synthetic_observations(
         frames=frames,
         pts_xyz=pts_xyz_raw,
-        intr=intr_scaled,
+        intr_internal=intr_internal_scaled,
+        intr_export=intr_export,
         num_terrain_points=args.num_terrain_points,
         verbose=args.verbose,
     )
@@ -1567,8 +1799,8 @@ def main():
         print("Aucun point 3D avec track après filtrage.")
         sys.exit(5)
 
-    log("[8/9] Filtrage des images sans homologue conservé + préparation images...", 1, args.verbose)
-    frames, observations_by_image, tracks_kept, old_to_new_image_id = filter_frames_with_observations_and_remap(
+    log("[8/9] Filtrage images + préparation images...", 1, args.verbose)
+    frames, observations_by_image, tracks_kept, _ = filter_frames_with_observations_and_remap(
         frames=frames,
         observations_by_image=observations_by_image,
         tracks_by_point=tracks_kept,
@@ -1578,19 +1810,6 @@ def main():
     if not frames:
         print("Aucune image ne possède de point homologue conservé.")
         sys.exit(6)
-
-    # Appliquer le même filtrage / remap à frames
-    view_by_old_id = {}
-    for idx, fr in enumerate(frames, start=1):
-        view_by_old_id[idx] = fr
-
-    frames_kept = []
-    for old_id, new_id in old_to_new_image_id.items():
-        fr = dict(view_by_old_id[old_id])
-        fr["image_id"] = new_id
-        frames_kept.append(fr)
-
-    frames = frames_kept
 
     selected_source_paths = [Path(fr["source_image"]) for fr in frames]
     exported_index = prepare_selected_images(
@@ -1609,22 +1828,12 @@ def main():
             raise RuntimeError(f"Image exportée absente après préparation: {stem}")
         fr["frame_name"] = exported_img.name
 
-    for fr in frames:
-        stem = fr["source_stem"]
-        exported_img = exported_index.get(stem)
-        if exported_img is None:
-            raise RuntimeError(f"Image exportée absente après préparation: {stem}")
-        fr["frame_name"] = exported_img.name
+    log(f"  {len(exported_index)} image(s) préparée(s)", 1, args.verbose)
 
-    log(f"  {len(exported_index)} image(s) utile(s) préparée(s).", 1, args.verbose)
-
-    log("[9/9] Écriture COLMAP + sorties viewer...", 1, args.verbose)
-    centers = np.stack([fr["center"] for fr in frames], axis=0)
-
+    log("[9/9] Écriture COLMAP + transforms + PLY...", 1, args.verbose)
+    centers = np.stack([fr["center_eors"] for fr in frames], axis=0)
     applied_transform = get_nerfstudio_axis_transform_4x4()
     applied_scale = 1.0
-    visual_down = get_visual_downward_transform_4x4()
-
     pts_xyz_kept_ns = apply_transform_to_points(pts_xyz_kept, applied_transform, applied_scale)
 
     write_scene_normalization_json(
@@ -1634,7 +1843,7 @@ def main():
         centers,
     )
 
-    write_cameras_txt_opencv(out_sparse / "cameras.txt", intr_scaled)
+    write_cameras_txt_opencv(out_sparse / "cameras.txt", intr_export)
     write_images_txt(out_sparse / "images.txt", frames, observations_by_image)
     write_points3D_txt(
         out_sparse / "points3D.txt",
@@ -1647,10 +1856,9 @@ def main():
     write_ply_xyzrgb(sparse_pc_ply, pts_xyz_kept_ns, pts_rgb_kept)
 
     build_transforms_json(
-        out_dir / "transforms.json",
+        transforms_json,
         frames,
-        intr_scaled,
-        extra_c2w_right_multiply=None,
+        intr_export,
         applied_transform=applied_transform,
         applied_scale=applied_scale,
     )
@@ -1673,7 +1881,7 @@ def main():
     print(f"Images utiles: {out_images}")
     print(f"COLMAP sparse: {out_sparse}")
     print(f"Sparse PLY viewer: {sparse_pc_ply}")
-    print(f"Transforms viewer: {out_dir / 'transforms.json'}")
+    print(f"Transforms viewer: {transforms_json}")
     print(f"Normalisation: {normalization_json}")
     print(f"Intrinsics estimées: {intrinsics_json}")
 
