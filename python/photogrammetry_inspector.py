@@ -811,7 +811,7 @@ class InspectorApp:
         self.point_ids = pointcloud_data["point_ids"]
         self.point_observations = pointcloud_data.get("observations", {})
         self.z_positive = bool(z_positive)
-        
+
         self.point_id_to_global_index = {
             int(pid): idx for idx, pid in enumerate(self.point_ids)
         }
@@ -929,12 +929,8 @@ class InspectorApp:
             gui.Margins(0, 0, 0, 0)
         )
 
-        self.right_panel.add_child(
-            self.right_items_layout
-        )
-        self.right_panel_background.add_child(
-            self.right_panel
-        )
+        self.right_panel.add_child(self.right_items_layout)
+        self.right_panel_background.add_child(self.right_panel)
 
         self.panel_width = int(22 * self.em)
         self.right_width = int(42 * self.em)
@@ -961,7 +957,20 @@ class InspectorApp:
         self._populate_scene()
         self._install_interaction_handlers()
         self._refresh_image_list_for_selection()
-        self._on_recenter()
+
+        # IMPORTANT: position initiale = exactement comme bouton "Recenter view",
+        # après que la fenêtre ait été layoutée et affichée.
+        self._did_initial_recenter = False
+
+        def _tick_initial_recenter():
+            if self._did_initial_recenter:
+                return
+            f = self.scene_widget.frame
+            if f.width > 1 and f.height > 1:
+                self._did_initial_recenter = True
+                self._on_recenter()
+
+        self.window.set_on_tick_event(_tick_initial_recenter)
 
     def _get_displayed_points_and_ids(self):
         if self.state.get("show_only_tracked_points", False):
@@ -1596,7 +1605,9 @@ class InspectorApp:
         title = gui.Label(f"{item['name']}")
         block.add_child(title)
 
-        subtitle = gui.Label(f"depth={item['depth']:.2f}")
+        subtitle = gui.Label(
+            f"uv=({item['u']:.1f}, {item['v']:.1f}) | z_cam={item['depth']:.3f}"
+        )
         block.add_child(subtitle)
 
         try:
@@ -1754,11 +1765,15 @@ class InspectorApp:
                 self.verbose,
             )
 
+            u, v = float(proj["uv"][0]), float(proj["uv"][1])
+
             projections_per_image.append({
                 "image_id": image_id,
                 "name": image_name,
                 "image_path": image_path,
                 "uv": proj["uv"].reshape(1, 2),
+                "u": u,
+                "v": v,
                 "depth": float(proj["depth"]),
                 "width": int(cam["width"]),
                 "height": int(cam["height"]),
@@ -1766,7 +1781,7 @@ class InspectorApp:
 
             info(f"Image retenue: {image_name}")
 
-        projections_per_image.sort(key=lambda x: x["depth"])
+        projections_per_image.sort(key=lambda x: x["name"].lower())
 
         info(
             f"Nombre total d'images "
