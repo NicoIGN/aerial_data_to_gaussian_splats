@@ -838,9 +838,7 @@ class InspectorApp:
             self.raw_point_colors = None
             self.tracked_point_colors = None
 
-        info(
-            f"Points trackés: {int(np.count_nonzero(self.tracked_mask))} / {len(self.point_ids)}"
-        )
+        info(f"Points trackés: {int(np.count_nonzero(self.tracked_mask))} / {len(self.point_ids)}")
 
         self.colmap_images = colmap_images
         self.colmap_cameras = colmap_cameras
@@ -869,62 +867,34 @@ class InspectorApp:
         self.app = gui.Application.instance
         self.app.initialize()
 
-        self.window = self.app.create_window(
-            "Inspection photogrammétrique",
-            1900,
-            1080
-        )
+        self.window = self.app.create_window("Inspection photogrammétrique", 1900, 1080)
 
         self.em = self.window.theme.font_size
         self.margin = 0.5 * self.em
 
         self.scene_widget = gui.SceneWidget()
-        self.scene_widget.scene = rendering.Open3DScene(
-            self.window.renderer
-        )
-        self.scene_widget.scene.set_background(
-            [0.08, 0.08, 0.08, 1.0]
-        )
+        self.scene_widget.scene = rendering.Open3DScene(self.window.renderer)
+        self.scene_widget.scene.set_background([0.08, 0.08, 0.08, 1.0])
 
         self.left_panel = gui.Vert(
             0.25 * self.em,
-            gui.Margins(
-                self.margin,
-                self.margin,
-                self.margin,
-                self.margin
-            )
+            gui.Margins(self.margin, self.margin, self.margin, self.margin)
         )
 
         self.right_panel_background = gui.Vert(
             0.25 * self.em,
-            gui.Margins(
-                self.margin,
-                self.margin,
-                self.margin,
-                self.margin
-            )
+            gui.Margins(self.margin, self.margin, self.margin, self.margin)
         )
 
-        self.right_title = gui.Label(
-            "Images contenant le point sélectionné"
-        )
-        self.right_panel_background.add_child(
-            self.right_title
-        )
+        self.right_title = gui.Label("Images contenant le point sélectionné")
+        self.right_panel_background.add_child(self.right_title)
 
         self.right_panel = gui.ScrollableVert(
             0.25 * self.em,
-            gui.Margins(
-                self.margin,
-                self.margin,
-                self.margin,
-                self.margin
-            )
+            gui.Margins(self.margin, self.margin, self.margin, self.margin)
         )
 
-        self.right_items_layout = gui.VGrid(
-            3,
+        self.right_items_layout = gui.Vert(
             0.35 * self.em,
             gui.Margins(0, 0, 0, 0)
         )
@@ -933,7 +903,12 @@ class InspectorApp:
         self.right_panel_background.add_child(self.right_panel)
 
         self.panel_width = int(22 * self.em)
-        self.right_width = int(42 * self.em)
+        self.right_width = int(52 * self.em)
+        self.card_min_width = int(14 * self.em)
+
+        # NOUVEAU: état d'affichage manuel du panneau droit
+        self.user_show_right_panel = True
+        self.right_panel_has_content = False
 
         self.state = {
             "point_size": float(point_size),
@@ -947,30 +922,49 @@ class InspectorApp:
             "frustum_scale_pending": float(frustum_scale),
         }
 
-        dbg(
-            f"Point observations chargées: "
-            f"{len(self.point_observations)} points trackés",
-            self.verbose,
-        )
+        dbg(f"Point observations chargées: {len(self.point_observations)} points trackés", self.verbose)
 
         self._build_ui()
         self._populate_scene()
         self._install_interaction_handlers()
         self._refresh_image_list_for_selection()
 
-        # IMPORTANT: position initiale = exactement comme bouton "Recenter view",
-        # après que la fenêtre ait été layoutée et affichée.
+        self.right_panel_background.visible = False
+
         self._did_initial_recenter = False
+        self._is_closing = False
 
         def _tick_initial_recenter():
-            if self._did_initial_recenter:
+            if self._is_closing or self._did_initial_recenter:
                 return
             f = self.scene_widget.frame
             if f.width > 1 and f.height > 1:
                 self._did_initial_recenter = True
-                self._on_recenter()
+                try:
+                    self._on_recenter()
+                except Exception as e:
+                    dbg(f"Recentrage initial ignoré: {e}", self.verbose)
 
         self.window.set_on_tick_event(_tick_initial_recenter)
+
+        def _on_close():
+            self._is_closing = True
+            return True
+
+        self.window.set_on_close(_on_close)
+
+    def _on_toggle_right_panel_visibility(self):
+        self.user_show_right_panel = not self.user_show_right_panel
+
+        should_show = self.user_show_right_panel and self.right_panel_has_content
+        self.right_panel_background.visible = bool(should_show)
+
+        self.toggle_right_panel_button.text = (
+            "Masquer panneau images" if self.user_show_right_panel else "Afficher panneau images"
+        )
+
+        self.window.set_needs_layout()
+        self.window.post_redraw()
 
     def _get_displayed_points_and_ids(self):
         if self.state.get("show_only_tracked_points", False):
@@ -1053,6 +1047,11 @@ class InspectorApp:
         self.recenter_button.set_on_clicked(self._on_recenter)
         self.left_panel.add_child(self.recenter_button)
 
+        # NOUVEAU: bouton afficher/masquer panneau droit
+        self.toggle_right_panel_button = gui.Button("Masquer panneau images")
+        self.toggle_right_panel_button.set_on_clicked(self._on_toggle_right_panel_visibility)
+        self.left_panel.add_child(self.toggle_right_panel_button)
+
         self.left_panel.add_child(gui.Label("Selection"))
         self.left_panel.add_child(gui.Label("Clic: nearest visible point (buffer Z)"))
 
@@ -1066,12 +1065,18 @@ class InspectorApp:
         def _on_layout(ctx):
             rect = self.window.content_rect
             self.left_panel.frame = gui.Rect(rect.x, rect.y, self.panel_width, rect.height)
-            self.right_panel_background.frame = gui.Rect(
-                rect.get_right() - self.right_width, rect.y, self.right_width, rect.height
-            )
-            center_x = rect.x + self.panel_width
-            center_w = rect.width - self.panel_width - self.right_width
-            self.scene_widget.frame = gui.Rect(center_x, rect.y, center_w, rect.height)
+
+            if self.right_panel_background.visible:
+                self.right_panel_background.frame = gui.Rect(
+                    rect.get_right() - self.right_width, rect.y, self.right_width, rect.height
+                )
+                center_x = rect.x + self.panel_width
+                center_w = rect.width - self.panel_width - self.right_width
+                self.scene_widget.frame = gui.Rect(center_x, rect.y, center_w, rect.height)
+            else:
+                center_x = rect.x + self.panel_width
+                center_w = rect.width - self.panel_width
+                self.scene_widget.frame = gui.Rect(center_x, rect.y, center_w, rect.height)
 
         self.window.set_on_layout(_on_layout)
 
@@ -1589,8 +1594,7 @@ class InspectorApp:
         except Exception:
             pass
 
-        self.right_items_layout = gui.VGrid(
-            3,
+        self.right_items_layout = gui.Vert(
             0.35 * self.em,
             gui.Margins(0, 0, 0, 0)
         )
@@ -1636,98 +1640,49 @@ class InspectorApp:
 
         if self.selected_point_xyz is None:
             info("Aucun point sélectionné: aucune image à afficher.")
-            self.right_items_layout.add_child(
-                gui.Label("Aucun point sélectionné.")
-            )
+            self.right_panel_has_content = False
+            self.right_panel_background.visible = False
+            self.window.set_needs_layout()
             return
 
         if self.selected_point_index is None:
             warn("selected_point_index=None")
+            self.right_panel_has_content = False
+            self.right_panel_background.visible = False
+            self.window.set_needs_layout()
             return
 
         point_id = int(self.point_ids[self.selected_point_index])
 
         if self.state["only_colmap_observations"]:
             obs = self.point_observations.get(point_id)
-            candidate_image_ids = (
-                obs.get("image_ids", [])
-                if obs is not None
-                else []
-            )
-
-            info(
-                f"Mode observations COLMAP : "
-                f"point_id={point_id} "
-                f"({len(candidate_image_ids)} image(s))"
-            )
+            candidate_image_ids = obs.get("image_ids", []) if obs is not None else []
+            info(f"Mode observations COLMAP : point_id={point_id} ({len(candidate_image_ids)} image(s))")
         else:
             candidate_image_ids = list(self.colmap_images.keys())
-
-            info(
-                f"Mode toutes les images : "
-                f"point_id={point_id} "
-                f"({len(candidate_image_ids)} image(s) testées)"
-            )
+            info(f"Mode toutes les images : point_id={point_id} ({len(candidate_image_ids)} image(s) testées)")
 
         projections_per_image = []
 
         if not candidate_image_ids:
-            warn(
-                f"Aucune observation COLMAP "
-                f"pour point_id={point_id}"
-            )
-            self.right_items_layout.add_child(
-                gui.Label(
-                    "Aucune image ne contient ce point."
-                )
-            )
+            self.right_panel_has_content = False
+            self.right_panel_background.visible = False
+            self.window.set_needs_layout()
             return
 
         for image_id in candidate_image_ids:
             colmap_image = self.colmap_images.get(image_id)
-
             if colmap_image is None:
-                warn(
-                    f"Image COLMAP absente: "
-                    f"image_id={image_id}"
-                )
                 continue
 
             cam = self.colmap_cameras.get(colmap_image["camera_id"])
-
             if cam is None:
-                warn(
-                    f"Caméra introuvable "
-                    f"pour image_id={image_id}"
-                )
                 continue
 
             image_name = colmap_image["name"]
-
-            dbg(
-                f"Test image trackée: "
-                f"id={image_id}, "
-                f"name={image_name}",
-                self.verbose,
-            )
-
-            image_path = resolve_image_path(
-                self.images_dir,
-                image_name,
-                verbose=self.verbose,
-            )
-
+            image_path = resolve_image_path(self.images_dir, image_name, verbose=self.verbose)
             if image_path is None:
-                warn(
-                    f"Image non trouvée "
-                    f"dans images/: {image_name}"
-                )
                 continue
-
-            dbg(
-                f"Image résolue: {image_path}",
-                self.verbose,
-            )
 
             try:
                 proj = project_world_point(
@@ -1736,34 +1691,11 @@ class InspectorApp:
                     self.selected_point_xyz,
                     z_positive=self.z_positive,
                 )
-
-            except NotImplementedError as e:
-                warn(
-                    f"Projection non supportée "
-                    f"pour {image_name}: {e}"
-                )
+            except NotImplementedError:
                 proj = None
 
-            if proj is None:
-                dbg("projection=None", self.verbose)
+            if proj is None or not proj["inside"]:
                 continue
-
-            if not proj["inside"]:
-                dbg(
-                    f"Hors image "
-                    f"u={proj['uv'][0]:.2f}, "
-                    f"v={proj['uv'][1]:.2f}",
-                    self.verbose,
-                )
-                continue
-
-            dbg(
-                f"Dedans "
-                f"u={proj['uv'][0]:.2f}, "
-                f"v={proj['uv'][1]:.2f}, "
-                f"z={proj['depth']:.3f}",
-                self.verbose,
-            )
 
             u, v = float(proj["uv"][0]), float(proj["uv"][1])
 
@@ -1779,55 +1711,46 @@ class InspectorApp:
                 "height": int(cam["height"]),
             })
 
-            info(f"Image retenue: {image_name}")
-
         projections_per_image.sort(key=lambda x: x["name"].lower())
 
-        info(
-            f"Nombre total d'images "
-            f"affichables: "
-            f"{len(projections_per_image)}"
-        )
-
         if not projections_per_image:
-            warn(
-                "Aucune image exploitable "
-                "pour le point sélectionné"
-            )
-
-            self.right_items_layout.add_child(
-                gui.Label(
-                    "Aucune image ne contient "
-                    "le point sélectionné."
-                )
-            )
+            self.right_panel_has_content = False
+            self.right_panel_background.visible = False
+            self.window.set_needs_layout()
             return
 
-        header = gui.Label(
-            f"{len(projections_per_image)} "
-            f"image(s) correspondante(s)"
-        )
+        self.right_panel_has_content = True
+        self.right_panel_background.visible = bool(self.user_show_right_panel)
+        self.window.set_needs_layout()
 
+        header = gui.Label(f"{len(projections_per_image)} image(s) correspondante(s)")
         self.right_items_layout.add_child(header)
-        self.right_items_layout.add_child(gui.Label(""))
-        self.right_items_layout.add_child(gui.Label(""))
 
-        cards = [
-            self._make_image_card(item)
-            for item in projections_per_image
-        ]
+        gap = 0.35 * self.em
 
-        remainder = len(cards) % 3
+        for i in range(0, len(projections_per_image), 3):
+            row = gui.Horiz(gap, gui.Margins(0, 0, 0, 0))
 
-        if remainder != 0:
-            for _ in range(3 - remainder):
-                cards.append(gui.Label(""))
+            chunk = projections_per_image[i:i+3]
+            for item in chunk:
+                card = self._make_image_card(item)
+                wrap = gui.Vert(0, gui.Margins(0, 0, 0, 0))
+                wrap.add_child(card)
+                row.add_child(wrap)
 
-        for card in cards:
-            self.right_items_layout.add_child(card)
+            for _ in range(3 - len(chunk)):
+                row.add_child(gui.Label(""))
+
+            self.right_items_layout.add_child(row)
 
     def run(self):
-        self.app.run()
+        try:
+            self.app.run()
+        except Exception as e:
+            # Evite crash bruyant à la fermeture sur certains backends Open3D
+            if not getattr(self, "_is_closing", False):
+                raise
+            dbg(f"Exception ignorée pendant fermeture: {e}", self.verbose)
 
 
 def main():
