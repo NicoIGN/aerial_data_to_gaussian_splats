@@ -949,11 +949,22 @@ class InspectorApp:
 
         def _on_close():
             self._is_closing = True
+            # Désactiver TOUS les callbacks avant destruction
+            try:
+                self.window.set_on_tick_event(None)
+                self.window.set_on_layout(None)
+                self.scene_widget.set_on_mouse(None)
+            except Exception:
+                pass
             return True
 
         self.window.set_on_close(_on_close)
 
+        self.window.set_on_close(_on_close)
+
     def _on_toggle_right_panel_visibility(self):
+        if getattr(self, "_is_closing", False):
+            return
         self.user_show_right_panel = not self.user_show_right_panel
 
         should_show = self.user_show_right_panel and self.right_panel_has_content
@@ -1636,6 +1647,8 @@ class InspectorApp:
         return block
 
     def _refresh_image_list_for_selection(self):
+        if getattr(self, "_is_closing", False):
+            return
         self._clear_right_panel()
 
         if self.selected_point_xyz is None:
