@@ -44,8 +44,8 @@ except ImportError:
 
 IMAGE_EXTS = {".jp2", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
-# Rotation propre qui convertit un repère caméra "optique = -Z"
-# vers un repère caméra "optique = +Z" compatible avec l'inspector
+# Rotation propre pour mettre l'axe optique sur +Z caméra
+# côté viewer / inspector.
 S_INSPECTOR = np.diag([1.0, -1.0, -1.0])
 
 
@@ -515,14 +515,21 @@ def filter_xy_bbox(xyz: np.ndarray, rgb: np.ndarray | None, xmin=None, xmax=None
     return xyz2, rgb2
 
 
+def convert_direct_obs_to_colmap_indirect(c, l, height=None):
+    # Convention observations fixée :
+    # - origine coin supérieur gauche
+    # - c vers la droite
+    # - l négatif pour repère direct
+    # Donc vers raster comparable à COLMAP :
+    # u = c
+    # v = -l
+    return float(c), float(-l)
+
+
 def convert_intrinsics_direct_to_indirect(intr):
     out = dict(intr)
-    out["cy"] = float(intr["height"]) - float(intr["cy"])
+    out["cy"] = -float(intr["cy"])
     return out
-
-
-def convert_direct_obs_to_colmap_obs(c, l, height):
-    return float(c), float(height) - float(l)
 
 
 def convert_pose_internal_to_inspector(R_cw_internal, t_internal):
@@ -553,23 +560,23 @@ def project_point_internal_direct(R_cw_internal, t_internal, intr_internal, xyz)
     }
 
 
-def project_point_export_colmap(R_cw_internal, t_internal, intr_internal, intr_export, xyz):
+def project_point_colmap_formula_from_internal_direct(R_cw_internal, t_internal, intr_internal, intr_export, xyz):
     proj = project_point_internal_direct(R_cw_internal, t_internal, intr_internal, xyz)
     if proj is None:
         return None
 
-    u_dir, v_dir = proj["uv_direct"]
-    u_col = float(u_dir)
-    v_col = float(intr_export["height"] - v_dir)
+    uv_direct = proj["uv_direct"]
+    u_col = float(uv_direct[0])
+    v_col = float(-uv_direct[1])
 
     R_cw_export, t_export = convert_pose_internal_to_inspector(R_cw_internal, t_internal)
     Xc_export = R_cw_export @ xyz + t_export
 
     return {
         "uv": np.array([u_col, v_col], dtype=np.float64),
-        "Xc_export": Xc_export,
+        "z": proj["depth_internal"],
+        "Xc": Xc_export,
         "Xc_internal": proj["Xc_internal"],
-        "depth_internal": proj["depth_internal"],
     }
 
 
@@ -717,8 +724,6 @@ def debug_validate_colmap_formula_on_observations(eors_df, image_index, tp3d, fr
     frame_by_stem = {fr["source_stem"]: fr for fr in frames}
 
     log("[DEBUG-COLMAP] Vérification formule export + poses inspector sur observations", 1, verbose)
-    log("[DEBUG-COLMAP] source obs: repère direct ; export image: repère indirect", 1, verbose)
-    log("[DEBUG-COLMAP] pose export: rotation 180° autour de X pour compatibilité inspector", 1, verbose)
 
     shown = 0
     global_err = []
@@ -758,7 +763,7 @@ def debug_validate_colmap_formula_on_observations(eors_df, image_index, tp3d, fr
                 continue
 
             xyz = np.asarray(xyz, dtype=np.float64)
-            proj = project_point_export_colmap(
+            proj = project_point_colmap_formula_from_internal_direct(
                 R_cw_internal,
                 t_internal,
                 intr_internal,
@@ -770,12 +775,14 @@ def debug_validate_colmap_formula_on_observations(eors_df, image_index, tp3d, fr
 
             visible += 1
 
-            if proj["Xc_export"][2] > 0:
+            if proj["Xc"][2] > 0:
                 positive_z += 1
 
             uv = proj["uv"]
-            c_obs_colmap, l_obs_colmap = convert_direct_obs_to_colmap_obs(
-                c_obs_direct, l_obs_direct, intr_export["height"]
+            c_obs_colmap, l_obs_colmap = convert_direct_obs_to_colmap_indirect(
+                c_obs_direct,
+                l_obs_direct,
+                intr_export["height"],
             )
 
             if 0.0 <= uv[0] < intr_export["width"] and 0.0 <= uv[1] < intr_export["height"]:
@@ -869,9 +876,6 @@ def build_synthetic_observations(frames, pts_xyz, intr_internal, intr_export, nu
         1,
         verbose,
     )
-    log("  Convention interne: repère direct, visible si Zc<0", 1, verbose)
-    log("  Convention export image: repère indirect", 1, verbose)
-    log("  Convention export pose: +Z caméra vers l'avant pour l'inspector", 1, verbose)
 
     iterable = selected_indices
     use_tqdm = verbose >= 1 and tqdm is not None
@@ -891,7 +895,7 @@ def build_synthetic_observations(frames, pts_xyz, intr_internal, intr_export, nu
         point3d_id = int(pt_idx + 1)
 
         for fr in frames:
-            proj = project_point_export_colmap(
+            proj = project_point_colmap_formula_from_internal_direct(
                 fr["R_cw_internal"],
                 fr["t_internal"],
                 intr_internal,
@@ -904,7 +908,7 @@ def build_synthetic_observations(frames, pts_xyz, intr_internal, intr_export, nu
             uv = proj["uv"]
             u, v = float(uv[0]), float(uv[1])
 
-            if proj["Xc_export"][2] <= 0:
+            if proj["Xc"][2] <= 0:
                 continue
 
             if not (0.0 <= u < width and 0.0 <= v < height):
@@ -1567,7 +1571,7 @@ def try_write_colmap_bin(sparse_dir: Path, verbose: int):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Génère un modèle COLMAP compatible avec l'inspector: image exportée en repère indirect et repère caméra converti pour regarder vers +Z côté viewer."
+        description="Génère un modèle COLMAP en gardant la calibration interne, avec conversion d'observations fixée: u=c, v=-l, et poses converties pour l'inspector."
     )
     ap.add_argument("--eors", required=True, help="Fichier eors.txt")
     ap.add_argument("--tp3d", required=True, help="Fichier tp.txt")
@@ -1614,8 +1618,7 @@ def main():
     transforms_json = out_dir / "transforms.json"
 
     log("[CONFIG] Calibration interne conservée", 1, args.verbose)
-    log("[CONFIG] Coordonnées image source: repère direct", 1, args.verbose)
-    log("[CONFIG] Coordonnées image export COLMAP: repère indirect", 1, args.verbose)
+    log("[CONFIG] Observations: u=c, v=-l", 1, args.verbose)
     log("[CONFIG] Conversion repère caméra 3D pour inspector: rotation 180° autour de X", 1, args.verbose)
 
     for d in [out_images, out_sparse, out_models_0]:
@@ -1715,6 +1718,10 @@ def main():
             "internal_camera_direct_scaled": intr_internal_scaled,
             "export_camera_indirect": intr_export,
             "camera_space_conversion_for_inspector": S_INSPECTOR.tolist(),
+            "obs_conversion": {
+                "u": "c",
+                "v": "-l"
+            },
             "residuals_internal": calib_stats["err"],
         }, f, indent=2)
 
