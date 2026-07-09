@@ -2,7 +2,7 @@
 # PERFORMANCE PROFILE
 ########################################
 
-TRAINING_PROFILE="splat/quality"
+TRAINING_PROFILE="gpu/highres-balanced"
 
 DEVICE="gpu"
 MODEL="splatfacto"
@@ -13,11 +13,9 @@ TRAIN_VIS_MODE="tensorboard"
 # IMAGE / PREPROCESSING
 ########################################
 
-# Stable full-res training
-CAMERA_RES_SCALE_FACTOR=1.0
-
-# Garde une résolution raisonnable
-MAX_RES=1080
+# Plus haute résolution que ton profil balanced, sans aller full 1.0
+CAMERA_RES_SCALE_FACTOR=1
+MAX_RES=5000
 
 NUM_DOWNSCALES=1
 SKIP_IMAGE_PROCESSING=true
@@ -26,77 +24,56 @@ SKIP_IMAGE_PROCESSING=true
 # TRAINING
 ########################################
 
-# Stable long training
-MAX_ITER=12000
+# Un peu plus long pour converger en plus haute résolution
+MAX_ITER=9000
 
-# IMPORTANT :
-# évite la densification tardive explosive
-STOP_SPLIT_AT=8000
+# Stop split avant la fin pour éviter l’explosion tardive
+STOP_SPLIT_AT=7000
 
-# Stable gradients
-# TRAIN_RAYS_PER_BATCH=1024
+# Batch un peu plus haut que 512 si VRAM ok
+TRAIN_RAYS_PER_BATCH=768
 
-# Bon compromis qualité/stabilité
-#NUM_NERF_SAMPLES_PER_RAY=48
-#NUM_PROPOSAL_SAMPLES_PER_RAY="128 128"
-
-########################################
-# GAUSSIAN SPLATTING
-########################################
-
-# Densification
-DENSIFY_GRAD_THRESH=0.0008
+# Signal de densification correct sans trop gonfler
+NUM_NERF_SAMPLES_PER_RAY=32
+NUM_PROPOSAL_SAMPLES_PER_RAY="64 32"
 
 ########################################
-# CLEANING
+# GAUSSIAN SPLATTING (CONTROLLED GROWTH)
 ########################################
 
-# Nettoyage alpha un peu plus agressif
-CULL_ALPHA_THRESH=0.1
+# Légèrement moins agressif que 0.00045 (=> moins de nouveaux splats)
+DENSIFY_GRAD_THRESH=0.00055
 
-# Évite gros splats écran
-CULL_SCREEN_SIZE=0.15
-SPLIT_SCREEN_SIZE=0.05
+# Nettoyage un peu strict
+CULL_ALPHA_THRESH=0.12
 
-########################################
-# DENSIFICATION CONTROL
-########################################
+# Contrôle écran : limite les gros splats et les splits super fins
+CULL_SCREEN_SIZE=0.22
+SPLIT_SCREEN_SIZE=0.03
 
-# Beaucoup plus stable à long terme
-REFINE_EVERY=100
+# Raffinement modéré (pas trop fréquent)
+REFINE_EVERY=220
 
-# PARAMÈTRE CRITIQUE
-# évite saturation alpha / écran blanc
-RESET_ALPHA_EVERY=30
-
-# Supprime davantage de gros splats instables
+# Stabilisation
+RESET_ALPHA_EVERY=35
 CULL_SCALE_THRESH=0.5
 
 ########################################
 # QUALITY / REGULARIZATION
 ########################################
 
-# Améliore la stabilité visuelle en corrigeant les variations de couleur locales
-USE_BILATERAL_GRID=True
+USE_BILATERAL_GRID=true
+USE_SCALE_REGULARIZATION=true
 
-# Désactive la régularisation des échelles des gaussiennes (plus de liberté mais moins de contraintes)
-USE_SCALE_REGULARIZATION=True
-
-# Limite la taille des covariances pour éviter des splats trop étalés
-MAX_GAUSS_RATIO=5.0
-
-# Équilibre entre fidélité visuelle et préservation de la structure de l’image
-SSIM_LAMBDA=0.2
+MAX_GAUSS_RATIO=4.5
+SSIM_LAMBDA=0.22
 
 ########################################
-# TRAINING STABILITY (GPU OPTIMIZATION DISABLED)
+# TRAINING STABILITY
 ########################################
 
-#Désactive la précision mixte (FP16), entraînement plus lent mais plus stable numériquement
-MIXED_PRECISION=False
-
-#Désactive le scaling des gradients utilisé avec la précision mixte
-USE_GRAD_SCALER=False
+MIXED_PRECISION=True
+USE_GRAD_SCALER=True
 
 ########################################
 # EXPORT
