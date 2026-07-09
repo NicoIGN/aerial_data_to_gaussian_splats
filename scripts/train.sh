@@ -390,6 +390,8 @@ if [[ "$DEVICE" == "gpu" ]]; then
         if [[ "$STOP_SPLIT_AT" -eq 0 ]]; then
             add_arg MODEL_ARGS --optimizers.means.optimizer.lr 0.0001
             add_arg MODEL_ARGS --pipeline.model.camera-optimizer.mode off
+        else
+            add_arg MODEL_ARGS --pipeline.model.camera-optimizer.mode "SO3xR3"
         fi
 
 elif [[ "$DEVICE" == "cpu" ]]; then
