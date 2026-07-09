@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import xml.etree.ElementTree as ET
 from PIL import Image, ExifTags
+import subprocess
 
 
 # =============================================================================
@@ -685,8 +686,15 @@ def _rational_to_float(v):
     except Exception:
         return None
 
+# =============================================================================
+# EXIF - lecture de la focale image
+# =============================================================================
 
-def get_exif_focal_mm(image_path: Path):
+def get_exif_focal_mm_from_pil(image_path: Path):
+    """
+    Essaie de lire la focale EXIF via Pillow.
+    Retourne la focale en millimètres, ou None si absente / illisible.
+    """
     try:
         with Image.open(image_path) as img:
             exif = _exif_dict(img)
@@ -695,6 +703,132 @@ def get_exif_focal_mm(image_path: Path):
         return _rational_to_float(exif["FocalLength"])
     except Exception:
         return None
+
+
+def _parse_focal_length_string(raw):
+    """
+    Parse des formes courantes:
+      - '21mm'
+      - '21.0 mm'
+      - '21/1'
+      - '21'
+    Retourne un float en mm ou None.
+    """
+    if raw is None:
+        return None
+
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    s = s.replace(" mm", "mm").replace("MM", "mm")
+
+    if s.lower().endswith("mm"):
+        s = s[:-2].strip()
+
+    if "/" in s:
+        try:
+            a, b = s.split("/", 1)
+            a = float(a.strip())
+            b = float(b.strip())
+            if abs(b) < 1e-12:
+                return None
+            return a / b
+        except Exception:
+            return None
+
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def get_exif_focal_mm_from_exiv2(image_path: Path):
+    """
+    Fallback robuste via exiv2.
+
+    Stratégie:
+      1. essaie exiv2 ciblé sur Exif.Photo.FocalLength
+      2. sinon essaie la sortie humaine de exiv2
+    """
+    # -------------------------------------------------------------------------
+    # tentative 1: sortie ciblée machine-friendly
+    # -------------------------------------------------------------------------
+    try:
+        cmd = ["exiv2", "-g", "Exif.Photo.FocalLength", "-Pt", str(image_path)]
+        res = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+
+        for line in lines:
+            val = _parse_focal_length_string(line)
+            if val is not None:
+                return val
+
+            parts = line.split()
+            if parts:
+                val = _parse_focal_length_string(parts[-1])
+                if val is not None:
+                    return val
+    except Exception:
+        pass
+
+    # -------------------------------------------------------------------------
+    # tentative 2: sortie humaine classique de exiv2
+    # ex:
+    #   Focal length    : 21.0 mm
+    # -------------------------------------------------------------------------
+    try:
+        cmd = ["exiv2", str(image_path)]
+        res = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        for line in res.stdout.splitlines():
+            if ":" not in line:
+                continue
+
+            left, right = line.split(":", 1)
+            key = left.strip().lower()
+            value = right.strip()
+
+            if key == "focal length":
+                val = _parse_focal_length_string(value)
+                if val is not None:
+                    return val
+    except Exception:
+        pass
+
+    return None
+
+
+def get_exif_focal_mm(image_path: Path):
+    """
+    Retourne la focale EXIF en mm.
+    Ordre de tentative:
+      1. PIL
+      2. exiv2
+    """
+    focal_mm = get_exif_focal_mm_from_pil(image_path)
+    if focal_mm is not None:
+        return focal_mm
+
+    focal_mm = get_exif_focal_mm_from_exiv2(image_path)
+    if focal_mm is not None:
+        return focal_mm
+
+    return None
+
+# =============================================================================
+# FIN EXIF - lecture de la focale image
+# =============================================================================
 
 
 def estimate_pixel_size_from_exif_and_colmap_focal(image_path: Path, fx: float, fy: float):

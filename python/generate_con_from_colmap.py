@@ -19,17 +19,81 @@ from con_camera_lib import (
 
 
 def choose_reference_image(images, reference_name=None):
+    """
+    - Si reference_name est fourni: match sur nom de fichier ou stem
+    - Sinon: prend la première image dans l'ordre de lecture COLMAP
+    """
+    image_values = list(images.values())
+
     if reference_name is not None:
-        for _, im in images.items():
+        for im in image_values:
             if Path(im["name"]).name == reference_name or Path(im["name"]).stem == reference_name:
                 return im
         raise ValueError(f"Image de référence introuvable: {reference_name}")
 
-    # défaut: première image triée par nom
-    ordered = sorted(images.values(), key=lambda d: d["name"])
-    if not ordered:
+    if not image_values:
         raise ValueError("Aucune image COLMAP trouvée")
-    return ordered[0]
+
+    return image_values[0]
+
+
+def build_recursive_image_index(image_dir: Path):
+    """
+    Construit deux index récursifs:
+      - par nom de fichier
+      - par stem
+    Si collisions, on garde une liste de chemins.
+    """
+    by_name = {}
+    by_stem = {}
+
+    for p in image_dir.rglob("*"):
+        if not p.is_file():
+            continue
+
+        name = p.name
+        stem = p.stem
+
+        by_name.setdefault(name, []).append(p)
+        by_stem.setdefault(stem, []).append(p)
+
+    return by_name, by_stem
+
+
+def resolve_image_path(image_name_from_colmap: str, image_dir: Path, by_name, by_stem):
+    """
+    Cherche une image COLMAP:
+      1. chemin direct sous image_dir
+      2. récursivement par nom exact
+      3. récursivement par stem
+    """
+    candidate_direct = image_dir / Path(image_name_from_colmap)
+    if candidate_direct.exists() and candidate_direct.is_file():
+        return candidate_direct
+
+    base_name = Path(image_name_from_colmap).name
+    stem = Path(image_name_from_colmap).stem
+
+    if base_name in by_name:
+        matches = by_name[base_name]
+        if len(matches) == 1:
+            return matches[0]
+        return sorted(matches)[0]
+
+    if stem in by_stem:
+        matches = by_stem[stem]
+        if len(matches) == 1:
+            return matches[0]
+        return sorted(matches)[0]
+
+    return None
+
+
+def compute_output_path(image_path: Path, image_stem: str, out_dir: Path | None):
+    if out_dir is None:
+        return image_path.parent / f"{image_stem}.CON"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / f"{image_stem}.CON"
 
 
 def main():
@@ -40,13 +104,26 @@ def main():
         )
     )
     ap.add_argument("--colmap-dir", required=True, help="Dossier contenant sparse/0")
-    ap.add_argument("--images-dir", required=True, help="Dossier des images source")
-    ap.add_argument("--out", required=True, help="Dossier de sortie des .CON")
+    ap.add_argument("--image-dir", required=True, help="Dossier racine des images source (scan récursif)")
+    ap.add_argument(
+        "--out-dir",
+        default=None,
+        help="Dossier de sortie des .CON. Si absent, écrit chaque .CON à côté de l'image source.",
+    )
+    ap.add_argument(
+        "--pixel-size",
+        type=float,
+        default=None,
+        help=(
+            "Taille pixel en mètres. Si fournie, elle est utilisée telle quelle. "
+            "Sinon, tentative d'estimation via la focale EXIF."
+        ),
+    )
     ap.add_argument("--geodesic", default="LAMBERT93", help="Valeur du champ <geodesique>")
     ap.add_argument(
         "--reference-image",
         default=None,
-        help="Nom ou stem de l'image de référence pour fitter les intrinsics .CON partagés",
+        help="Nom ou stem de l'image de référence. Par défaut: première image référencée dans COLMAP.",
     )
     ap.add_argument(
         "--grid-step",
@@ -80,26 +157,29 @@ def main():
     )
     args = ap.parse_args()
 
+    if args.pixel_size is not None and args.pixel_size <= 0:
+        raise ValueError("--pixel-size doit être strictement positif")
+
     colmap_dir = Path(args.colmap_dir)
-    images_dir = Path(args.images_dir)
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    image_dir = Path(args.image_dir)
+    out_dir = Path(args.out_dir) if args.out_dir is not None else None
 
     images = load_colmap_images(colmap_dir)
     cameras = load_colmap_cameras(colmap_dir)
 
-    print(f"[INFO] images : {len(images)}")
-    print(f"[INFO] cameras: {len(cameras)}")
+    print(f"[INFO] images COLMAP : {len(images)}")
+    print(f"[INFO] cameras       : {len(cameras)}")
 
-    # -------------------------------------------------------------------------
-    # Choix image/caméra de référence pour fitter UNE SEULE FOIS les intrinsics
-    # -------------------------------------------------------------------------
+    print(f"[INFO] scan récursif des images sous: {image_dir}")
+    by_name, by_stem = build_recursive_image_index(image_dir)
+    print(f"[INFO] index fichiers : {sum(len(v) for v in by_name.values())} fichiers trouvés")
+
     ref_im = choose_reference_image(images, args.reference_image)
     ref_cam = cameras[ref_im["camera_id"]]
     ref_intr = camera_to_intrinsics(ref_cam)
 
     print(
-        f"[INFO] reference image: {ref_im['name']} "
+        f"[INFO] reference image COLMAP: {ref_im['name']} "
         f"(camera_id={ref_im['camera_id']}, model={ref_cam['model']})"
     )
 
@@ -136,14 +216,16 @@ def main():
         f"n={validation['count']}"
     )
 
-    # -------------------------------------------------------------------------
-    # Génération de tous les .CON avec CES intrinsics partagés
-    # -------------------------------------------------------------------------
-    for _, im in sorted(images.items(), key=lambda kv: kv[1]["name"]):
+    if args.pixel_size is not None:
+        forced_pixel_size_value = f"{float(args.pixel_size):.15e}"
+        print(f"[INFO] pixel_size forcé par paramètre: {forced_pixel_size_value}")
+    else:
+        forced_pixel_size_value = None
+
+    for _, im in images.items():
         cam = cameras[im["camera_id"]]
         intr = camera_to_intrinsics(cam)
 
-        # Vérification cohérence dimensionnelle
         if intr["width"] != shared_con_intr["width"] or intr["height"] != shared_con_intr["height"]:
             raise ValueError(
                 "Toutes les images doivent partager la même taille pour réutiliser "
@@ -156,20 +238,31 @@ def main():
         t = np.asarray(im["tvec"], dtype=np.float64)
         center = -R_cw.T @ t
 
-        image_name_full = Path(im["name"]).name
         image_stem = Path(im["name"]).stem
-        image_path = images_dir / image_name_full
 
-        pixel_size_m = estimate_pixel_size_from_exif_and_colmap_focal(
-            image_path=image_path,
-            fx=intr["fx"],
-            fy=intr["fy"],
-        )
+        image_path = resolve_image_path(im["name"], image_dir, by_name, by_stem)
+        if image_path is None:
+            raise FileNotFoundError(
+                f"Image source introuvable récursivement sous --image-dir pour {im['name']}"
+            )
 
-        if pixel_size_m is None:
-            pixel_size_value = "UNKNOWN"
+        if forced_pixel_size_value is not None:
+            pixel_size_value = forced_pixel_size_value
         else:
+            pixel_size_m = estimate_pixel_size_from_exif_and_colmap_focal(
+                image_path=image_path,
+                fx=intr["fx"],
+                fy=intr["fy"],
+            )
+            if pixel_size_m is None:
+                raise RuntimeError(
+                    "Impossible d'estimer pixel_size à partir de l'EXIF pour "
+                    f"l'image {image_path}. "
+                    "Passe explicitement --pixel-size <valeur_en_metres>."
+                )
             pixel_size_value = f"{pixel_size_m:.15e}"
+
+        out_path = compute_output_path(image_path, image_stem, out_dir)
 
         root = build_orientation_xml(
             image_name=image_stem,
@@ -181,16 +274,21 @@ def main():
         )
 
         xml_bytes = prettify_xml(root)
-        out_path = out_dir / f"{image_stem}.CON"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "wb") as f:
             f.write(xml_bytes)
 
         print(
-            f"[INFO] wrote {out_path.name}: "
-            f"center=({center[0]:.3f},{center[1]:.3f},{center[2]:.3f})"
+            f"[INFO] wrote {out_path}: "
+            f"center=({center[0]:.3f},{center[1]:.3f},{center[2]:.3f}) "
+            f"image_path={image_path} "
+            f"pixel_size={pixel_size_value}"
         )
 
-    print(f"[INFO] Fichiers .CON écrits dans {out_dir}")
+    if out_dir is None:
+        print("[INFO] Fichiers .CON écrits à côté des images source")
+    else:
+        print(f"[INFO] Fichiers .CON écrits dans {out_dir}")
 
 
 if __name__ == "__main__":

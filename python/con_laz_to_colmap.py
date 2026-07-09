@@ -10,9 +10,8 @@ import time
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import subprocess
-
-
 import os
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import numpy as np
@@ -47,15 +46,58 @@ def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
-def build_image_index(images_dir: Path):
-    index = {}
-    for p in images_dir.iterdir():
+def build_image_index(image_dir: Path):
+    """
+    Index récursif des images.
+    Retour:
+      - by_stem: stem -> chemin image
+      - by_name: nom fichier -> chemin image
+    En cas de collision, la première occurrence rencontrée est gardée.
+    """
+    by_stem = {}
+    by_name = {}
+
+    for p in sorted(image_dir.rglob("*")):
         if not p.is_file():
             continue
         if p.suffix.lower() not in IMAGE_EXTS:
             continue
-        index[p.stem] = p
-    return index
+
+        by_name.setdefault(p.name, p)
+        by_stem.setdefault(p.stem, p)
+
+    return by_stem, by_name
+
+
+def resolve_con_path_for_image(img_path: Path, image_dir: Path):
+    """
+    Cherche le .CON:
+      1. à côté de l'image
+      2. à côté de l'image en .con
+      3. récursivement sous image_dir par stem
+    """
+    c1 = img_path.with_suffix(".CON")
+    if c1.exists():
+        return c1
+
+    c2 = img_path.with_suffix(".con")
+    if c2.exists():
+        return c2
+
+    stem = img_path.stem
+    candidates = []
+    for p in image_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in {".con"}:
+            continue
+        if p.stem == stem:
+            candidates.append(p)
+
+    if candidates:
+        return sorted(candidates)[0]
+
+    return None
 
 
 def read_laz_points(laz_path: Path, stride: int):
@@ -435,9 +477,6 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
         verbose,
     )
 
-    # ---------------------------
-    # DEBUG SANITY CHECK (rapide)
-    # ---------------------------
     if verbose >= 1 and len(frames) > 0 and len(pts_xyz) > 0:
         sample_n_pts = min(2000, len(pts_xyz))
         sample_n_cam = min(5, len(frames))
@@ -587,14 +626,11 @@ def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by
         point3d_ids_kept = np.zeros((0,), dtype=np.int64)
         return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new, old_to_new_point_id, point3d_ids_kept
 
-    # IDs originaux (COLMAP) = old_idx + 1
     point3d_ids_kept = np.asarray([old_idx + 1 for old_idx in kept_old_indices], dtype=np.int64)
 
     if remap:
-        # mapping dict conservé pour compat
         old_to_new_point_id = {old_idx + 1: new_id for new_id, old_idx in enumerate(kept_old_indices, start=1)}
     else:
-        # identité sur les points conservés
         old_to_new_point_id = {old_idx + 1: old_idx + 1 for old_idx in kept_old_indices}
 
     pts_xyz_kept = pts_xyz[kept_old_indices]
@@ -602,9 +638,8 @@ def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by
     tracks_kept = [tracks_by_point[i] for i in kept_old_indices]
 
     if remap:
-        # --- FAST REMAP ---
         n_old = len(tracks_by_point)
-        lut = np.zeros(n_old + 1, dtype=np.int64)  # lut[old_pid] -> new_pid ; 0 = rejeté
+        lut = np.zeros(n_old + 1, dtype=np.int64)
         for new_pid, old_idx in enumerate(kept_old_indices, start=1):
             lut[old_idx + 1] = new_pid
 
@@ -635,11 +670,9 @@ def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by
 
             observations_new[image_id] = new_obs_list
 
-        # En mode remap, IDs écrits dans points3D.txt = 1..N_kept
         point3d_ids_kept = np.arange(1, len(kept_old_indices) + 1, dtype=np.int64)
 
     else:
-        # Pas de remap: observations inchangées (IDs originaux)
         observations_new = observations_by_image
 
     return pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_new, old_to_new_point_id, point3d_ids_kept
@@ -648,13 +681,12 @@ def filter_points_with_tracks(pts_xyz, pts_rgb, tracks_by_point, observations_by
 def filter_frames_with_observations_and_remap(frames, observations_by_image, tracks_by_point, verbose=1):
     use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
 
-    # 1) Garde uniquement les frames ayant des observations
     kept_frames = []
     old_to_new_image_id = {}
 
     for fr in frames:
         old_id = fr["image_id"]
-        if not observations_by_image.get(old_id):  # plus rapide que len(...) == 0
+        if not observations_by_image.get(old_id):
             continue
 
         new_id = len(kept_frames) + 1
@@ -663,7 +695,6 @@ def filter_frames_with_observations_and_remap(frames, observations_by_image, tra
         kept_frames.append(new_fr)
         old_to_new_image_id[old_id] = new_id
 
-    # Si aucune frame conservée, sortie rapide
     if not kept_frames:
         log(
             f"  Images conservées après filtrage par observations: 0/{len(frames)}",
@@ -672,19 +703,16 @@ def filter_frames_with_observations_and_remap(frames, observations_by_image, tra
         )
         return [], {}, [[] for _ in range(len(tracks_by_point))], {}
 
-    # 2) Remap observations par image (sans dict(o): on conserve les objets obs)
     new_observations_by_image = {}
     for old_id, new_id in old_to_new_image_id.items():
         obs_list = observations_by_image.get(old_id, [])
         new_observations_by_image[new_id] = obs_list
 
-    # 3) LUT dense pour remap image_id -> new_image_id (évite lookup dict dans la boucle interne)
     max_old_image_id = max(fr["image_id"] for fr in frames) if frames else 0
     image_lut = np.zeros(max_old_image_id + 1, dtype=np.int32)
     for old_id, new_id in old_to_new_image_id.items():
         image_lut[int(old_id)] = int(new_id)
 
-    # 4) Remap tracks (partie la plus lourde) + barre de progression
     new_tracks_by_point = [None] * len(tracks_by_point)
 
     iterable = enumerate(tracks_by_point)
@@ -1132,7 +1160,7 @@ def main():
         description="Convertit un dossier images + fichiers .CON + LAZ vers une structure de sortie type COLMAP / Nerfstudio."
     )
     ap.add_argument("--laz", required=True, help="Fichier .LAZ")
-    ap.add_argument("--images", required=True, help="Dossier des images source")
+    ap.add_argument("--image-dir", required=True, help="Dossier racine des images source (scan récursif)")
     ap.add_argument("--out", required=True, help="Dossier de sortie")
     ap.add_argument("--subsample", type=int, default=10, help="Facteur de sous-échantillonnage initial du LAZ")
     ap.add_argument("--image-factor", type=float, default=1.0,
@@ -1157,7 +1185,7 @@ def main():
     log(f"[TIME] Début: {dt_start.strftime('%Y-%m-%d %H:%M:%S')}", 1, args.verbose)
 
     laz_path = Path(args.laz)
-    images_dir = Path(args.images)
+    image_dir = Path(args.image_dir)
     out_dir = Path(args.out)
 
     script_dir = Path(__file__).resolve().parent
@@ -1176,11 +1204,11 @@ def main():
     for d in [out_images, out_sparse, out_models_0]:
         ensure_dir(d)
 
-    log("[1/8] Indexation des images existantes...", 1, args.verbose)
-    image_index = build_image_index(images_dir)
-    log(f"  {len(image_index)} images indexées.", 1, args.verbose)
+    log("[1/8] Indexation récursive des images existantes...", 1, args.verbose)
+    image_index_by_stem, image_index_by_name = build_image_index(image_dir)
+    log(f"  {len(image_index_by_stem)} images indexées.", 1, args.verbose)
 
-    if not image_index:
+    if not image_index_by_stem:
         print("Aucune image compatible trouvée dans le dossier fourni.")
         sys.exit(2)
 
@@ -1191,13 +1219,11 @@ def main():
     intrinsics_ref = None
     skipped_no_con = 0
 
-    for stem, src_img in sorted(image_index.items()):
-        con_path = src_img.with_suffix(".CON")
-        if not con_path.exists():
-            con_path = src_img.with_suffix(".con")
+    for stem, src_img in sorted(image_index_by_stem.items()):
+        con_path = resolve_con_path_for_image(src_img, image_dir)
 
-        if not con_path.exists():
-            log(f"[WARN] .CON introuvable pour {src_img.name}", 2, args.verbose)
+        if con_path is None:
+            log(f"[WARN] .CON introuvable pour {src_img}", 2, args.verbose)
             skipped_no_con += 1
             continue
 
