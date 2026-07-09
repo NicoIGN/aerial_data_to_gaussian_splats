@@ -36,10 +36,9 @@ except ImportError:
 
 IMAGE_EXTS = {".jp2", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
-# Occlusion mode: paramètres internes (volontairement non exposés en CLI)
-OCCLUSION_RADIUS_PX = 1          # rayon splat autour du pixel projeté
-OCCLUSION_TOL_ABS = 0.10         # tolérance absolue profondeur (en unités scène)
-OCCLUSION_TOL_REL = 0.01         # tolérance relative profondeur
+# Occlusion mode: tolérances internes (non exposées en CLI)
+OCCLUSION_TOL_ABS = 0.03
+OCCLUSION_TOL_REL = 0.001
 
 
 def log(msg: str, level: int, verbose: int):
@@ -258,7 +257,6 @@ def apply_cylindrical_systematism_local_to_image(c, l, transfo2d):
         return c, l
 
     C0 = float(transfo2d.get("C0", 0.0))
-    L0 = float(transfo2d.get("L0", 0.0))
     S1 = float(transfo2d.get("S1", 0.0))
     S2 = float(transfo2d.get("S2", 0.0))
 
@@ -280,7 +278,6 @@ def apply_cylindrical_systematism_image_to_local(c, l, transfo2d):
         return c, l
 
     C0 = float(transfo2d.get("C0", 0.0))
-    L0 = float(transfo2d.get("L0", 0.0))
     S1 = float(transfo2d.get("S1", 0.0))
     S2 = float(transfo2d.get("S2", 0.0))
 
@@ -468,7 +465,12 @@ def _camera_project_batch(fr, pts_xyz, z_positive=True):
 
     valid_idx = np.where(mask_front)[0]
     if len(valid_idx) == 0:
-        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64)
+        return (
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.float64),
+            np.empty((0,), dtype=np.float64),
+            np.empty((0,), dtype=np.float64),
+        )
 
     Xc_v = Xc[valid_idx]
     z_v = z[valid_idx]
@@ -488,7 +490,12 @@ def _camera_project_batch(fr, pts_xyz, z_positive=True):
     in_img = (u >= 0.0) & (u < width) & (v >= 0.0) & (v < height)
     keep = np.where(in_img)[0]
     if len(keep) == 0:
-        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64)
+        return (
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.float64),
+            np.empty((0,), dtype=np.float64),
+            np.empty((0,), dtype=np.float64),
+        )
 
     valid_idx = valid_idx[keep]
     u = u[keep]
@@ -497,7 +504,7 @@ def _camera_project_batch(fr, pts_xyz, z_positive=True):
     return valid_idx, u, v, z_v
 
 
-def _build_occlusion_depth_map_for_frame(fr, pts_xyz, z_positive, radius_px=1):
+def _build_occlusion_depth_map_for_frame(fr, pts_xyz, z_positive, radius_px=2):
     h, w = fr["height"], fr["width"]
     depth = np.full((h, w), np.inf, dtype=np.float32)
 
@@ -524,13 +531,12 @@ def _build_occlusion_depth_map_for_frame(fr, pts_xyz, z_positive, radius_px=1):
             mx = (xx >= 0) & (xx < w)
             if not np.any(mx):
                 continue
-
             np.minimum.at(depth, (yy2[mx], xx[mx]), z2[mx])
 
     return depth
 
 
-def build_occlusion_depth_maps(frames, pts_xyz, z_positive=True, verbose=1):
+def build_occlusion_depth_maps(frames, pts_xyz, z_positive=True, occlusion_radius=2, verbose=1):
     maps = {}
     use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
     iterable = frames
@@ -542,27 +548,44 @@ def build_occlusion_depth_maps(frames, pts_xyz, z_positive=True, verbose=1):
             fr,
             pts_xyz,
             z_positive=z_positive,
-            radius_px=OCCLUSION_RADIUS_PX
+            radius_px=occlusion_radius
         )
     return maps
 
 
-def is_visible_with_occlusion(depth_map, u, v, z):
+def is_visible_with_occlusion(depth_map, u, v, z, occlusion_radius=2):
     h, w = depth_map.shape
     x = int(np.floor(u))
     y = int(np.floor(v))
     if x < 0 or x >= w or y < 0 or y >= h:
         return False
 
-    zmin = float(depth_map[y, x])
-    if not np.isfinite(zmin):
+    x0 = max(0, x - occlusion_radius)
+    x1 = min(w, x + occlusion_radius + 1)
+    y0 = max(0, y - occlusion_radius)
+    y1 = min(h, y + occlusion_radius + 1)
+
+    patch = depth_map[y0:y1, x0:x1]
+    finite = np.isfinite(patch)
+    if not np.any(finite):
         return False
 
-    tol = OCCLUSION_TOL_ABS + OCCLUSION_TOL_REL * zmin
-    return z <= (zmin + tol)
+    zmin_local = float(np.min(patch[finite]))
+    tol = OCCLUSION_TOL_ABS + OCCLUSION_TOL_REL * max(zmin_local, 1e-6)
+
+    return z <= (zmin_local + tol)
 
 
-def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_points=None, verbose=1, z_positive=True, with_occlusion=False):
+def build_synthetic_observations(
+    frames,
+    pts_xyz,
+    pts_rgb=None,
+    num_terrain_points=None,
+    verbose=1,
+    z_positive=True,
+    with_occlusion=False,
+    occlusion_radius=2
+):
     num_pts_total = len(pts_xyz)
 
     if num_pts_total == 0:
@@ -596,7 +619,7 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
     occlusion_maps = None
     if with_occlusion:
         log(
-            f"  Occlusion activée (radius={OCCLUSION_RADIUS_PX}px, tol_abs={OCCLUSION_TOL_ABS}, tol_rel={OCCLUSION_TOL_REL})",
+            f"  Occlusion activée (radius={occlusion_radius}px, tol_abs={OCCLUSION_TOL_ABS}, tol_rel={OCCLUSION_TOL_REL})",
             1,
             verbose,
         )
@@ -605,6 +628,7 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
             frames=frames,
             pts_xyz=pts_for_depth,
             z_positive=z_positive,
+            occlusion_radius=occlusion_radius,
             verbose=verbose,
         )
 
@@ -651,7 +675,7 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
 
             if with_occlusion:
                 depth_map = occlusion_maps[image_id]
-                if not is_visible_with_occlusion(depth_map, u, v, depth):
+                if not is_visible_with_occlusion(depth_map, u, v, depth, occlusion_radius=occlusion_radius):
                     continue
 
             point2d_idx = len(observations_by_image[image_id])
@@ -1278,6 +1302,8 @@ def main():
                     help="Utilise la convention profondeur z<0 (par défaut: z>0).")
     ap.add_argument("--with-occlusion", action="store_true",
                     help="Active le filtrage d'occlusion (z-buffer local). Désactivé par défaut.")
+    ap.add_argument("--occlusion-radius", type=int, default=2,
+                    help="Rayon pixel du voisinage utilisé pour le test d'occlusion.")
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                     help="0=silencieux, 1=info, 2=warn+info")
     args = ap.parse_args()
@@ -1301,8 +1327,10 @@ def main():
     normalization_json = out_dir / "scene_normalization.json"
 
     z_positive = not args.z_negative
+    occlusion_radius = max(0, int(args.occlusion_radius))
     log(f"[CONFIG] z_positive={z_positive}", 1, args.verbose)
     log(f"[CONFIG] with_occlusion={args.with_occlusion}", 1, args.verbose)
+    log(f"[CONFIG] occlusion_radius={occlusion_radius}", 1, args.verbose)
 
     for d in [out_images, out_sparse, out_models_0]:
         ensure_dir(d)
@@ -1420,6 +1448,7 @@ def main():
         z_positive=z_positive,
         verbose=args.verbose,
         with_occlusion=args.with_occlusion,
+        occlusion_radius=occlusion_radius,
     )
 
     pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_by_image, old_to_new_point_id, point3d_ids_kept = filter_points_with_tracks(
