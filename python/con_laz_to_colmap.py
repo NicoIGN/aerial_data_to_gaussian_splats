@@ -36,6 +36,11 @@ except ImportError:
 
 IMAGE_EXTS = {".jp2", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
+# Occlusion mode: paramètres internes (volontairement non exposés en CLI)
+OCCLUSION_RADIUS_PX = 1          # rayon splat autour du pixel projeté
+OCCLUSION_TOL_ABS = 0.10         # tolérance absolue profondeur (en unités scène)
+OCCLUSION_TOL_REL = 0.01         # tolérance relative profondeur
+
 
 def log(msg: str, level: int, verbose: int):
     if verbose >= level:
@@ -47,13 +52,6 @@ def ensure_dir(path: Path):
 
 
 def build_image_index(image_dir: Path):
-    """
-    Index récursif des images.
-    Retour:
-      - by_stem: stem -> chemin image
-      - by_name: nom fichier -> chemin image
-    En cas de collision, la première occurrence rencontrée est gardée.
-    """
     by_stem = {}
     by_name = {}
 
@@ -70,12 +68,6 @@ def build_image_index(image_dir: Path):
 
 
 def resolve_con_path_for_image(img_path: Path, image_dir: Path):
-    """
-    Cherche le .CON:
-      1. à côté de l'image
-      2. à côté de l'image en .con
-      3. récursivement sous image_dir par stem
-    """
     c1 = img_path.with_suffix(".CON")
     if c1.exists():
         return c1
@@ -152,7 +144,7 @@ def get_nerfstudio_axis_transform_4x4():
     return T
 
 
-def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None):
+def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None, verbose: int = 1):
     n = len(xyz)
     if rgb is None:
         rgb = np.full((n, 3), 200, dtype=np.uint8)
@@ -162,6 +154,17 @@ def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None)
             rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
     xyz_out = np.asarray(xyz, dtype=np.float64)
+
+    use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
+    iterable = zip(xyz_out, rgb)
+
+    if use_tqdm:
+        iterable = tqdm(
+            iterable,
+            total=n,
+            desc="Écriture sparse_pc.ply",
+            unit="pt",
+        )
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("ply\n")
@@ -174,7 +177,7 @@ def write_ply_xyzrgb(path: Path, xyz: np.ndarray, rgb: np.ndarray | None = None)
         f.write("property uchar green\n")
         f.write("property uchar blue\n")
         f.write("end_header\n")
-        for p, c in zip(xyz_out, rgb):
+        for p, c in iterable:
             f.write(
                 f"{float(p[0]):.12f} {float(p[1]):.12f} {float(p[2]):.12f} "
                 f"{int(c[0])} {int(c[1])} {int(c[2])}\n"
@@ -446,7 +449,120 @@ def project_point(R_cw, t_cw, fx, fy, cx, cy, xyz, transfo2d=None, z_positive=Tr
     return np.array([u, v], dtype=np.float64), z
 
 
-def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_points=None, verbose=1, z_positive=True):
+def _camera_project_batch(fr, pts_xyz, z_positive=True):
+    R_cw = fr["R_cw"]
+    t_cw = fr["tvec"]
+    fx, fy, cx, cy = fr["fx"], fr["fy"], fr["cx"], fr["cy"]
+    width, height = fr["width"], fr["height"]
+    transfo2d = fr.get("transfo2d")
+
+    Xc = (pts_xyz @ R_cw.T) + t_cw.reshape(1, 3)
+    z_raw = Xc[:, 2]
+
+    if z_positive:
+        mask_front = z_raw > 1e-9
+        z = z_raw
+    else:
+        mask_front = z_raw < -1e-9
+        z = -z_raw
+
+    valid_idx = np.where(mask_front)[0]
+    if len(valid_idx) == 0:
+        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64)
+
+    Xc_v = Xc[valid_idx]
+    z_v = z[valid_idx]
+
+    u = fx * (Xc_v[:, 0] / z_v) + cx
+    v = fy * (Xc_v[:, 1] / z_v) + cy
+
+    if transfo2d is not None and transfo2d.get("Type") == "systematismeCylindriqueTopAero":
+        C0 = float(transfo2d.get("C0", 0.0))
+        S1 = float(transfo2d.get("S1", 0.0))
+        S2 = float(transfo2d.get("S2", 0.0))
+        ci = u.copy()
+        li = v.copy()
+        v = li + (ci - C0) * S1
+        u = ci + (ci - C0) * S2
+
+    in_img = (u >= 0.0) & (u < width) & (v >= 0.0) & (v < height)
+    keep = np.where(in_img)[0]
+    if len(keep) == 0:
+        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64)
+
+    valid_idx = valid_idx[keep]
+    u = u[keep]
+    v = v[keep]
+    z_v = z_v[keep]
+    return valid_idx, u, v, z_v
+
+
+def _build_occlusion_depth_map_for_frame(fr, pts_xyz, z_positive, radius_px=1):
+    h, w = fr["height"], fr["width"]
+    depth = np.full((h, w), np.inf, dtype=np.float32)
+
+    idx, u, v, z = _camera_project_batch(fr, pts_xyz, z_positive=z_positive)
+    if len(idx) == 0:
+        return depth
+
+    x = np.floor(u).astype(np.int32)
+    y = np.floor(v).astype(np.int32)
+    z = z.astype(np.float32)
+
+    for dy in range(-radius_px, radius_px + 1):
+        yy = y + dy
+        my = (yy >= 0) & (yy < h)
+        if not np.any(my):
+            continue
+
+        yy2 = yy[my]
+        x2 = x[my]
+        z2 = z[my]
+
+        for dx in range(-radius_px, radius_px + 1):
+            xx = x2 + dx
+            mx = (xx >= 0) & (xx < w)
+            if not np.any(mx):
+                continue
+
+            np.minimum.at(depth, (yy2[mx], xx[mx]), z2[mx])
+
+    return depth
+
+
+def build_occlusion_depth_maps(frames, pts_xyz, z_positive=True, verbose=1):
+    maps = {}
+    use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
+    iterable = frames
+    if use_tqdm:
+        iterable = tqdm(frames, total=len(frames), desc="Occlusion: build depth maps", unit="img")
+
+    for fr in iterable:
+        maps[fr["image_id"]] = _build_occlusion_depth_map_for_frame(
+            fr,
+            pts_xyz,
+            z_positive=z_positive,
+            radius_px=OCCLUSION_RADIUS_PX
+        )
+    return maps
+
+
+def is_visible_with_occlusion(depth_map, u, v, z):
+    h, w = depth_map.shape
+    x = int(np.floor(u))
+    y = int(np.floor(v))
+    if x < 0 or x >= w or y < 0 or y >= h:
+        return False
+
+    zmin = float(depth_map[y, x])
+    if not np.isfinite(zmin):
+        return False
+
+    tol = OCCLUSION_TOL_ABS + OCCLUSION_TOL_REL * zmin
+    return z <= (zmin + tol)
+
+
+def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_points=None, verbose=1, z_positive=True, with_occlusion=False):
     num_pts_total = len(pts_xyz)
 
     if num_pts_total == 0:
@@ -477,60 +593,20 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
         verbose,
     )
 
-    if verbose >= 1 and len(frames) > 0 and len(pts_xyz) > 0:
-        sample_n_pts = min(2000, len(pts_xyz))
-        sample_n_cam = min(5, len(frames))
-        sample_idx = np.linspace(0, len(pts_xyz) - 1, num=sample_n_pts, dtype=np.int64)
-
-        log("[DEBUG] Sanity check projections (échantillon)...", 1, verbose)
-
-        for fr in frames[:sample_n_cam]:
-            image_id = fr["image_id"]
-            R_cw = fr["R_cw"]
-            t_cw = fr["tvec"]
-            width = fr["width"]
-            height = fr["height"]
-            fx = fr["fx"]
-            fy = fr["fy"]
-            cx = fr["cx"]
-            cy = fr["cy"]
-            transfo2d = fr.get("transfo2d")
-
-            pos_z = 0
-            in_img = 0
-            z_vals = []
-
-            for idx in sample_idx:
-                xyz = pts_xyz[idx]
-                Xc = R_cw @ xyz + t_cw
-                z = float(Xc[2])
-                z_vals.append(z)
-
-                if z <= 1e-9:
-                    continue
-
-                pos_z += 1
-
-                u = fx * (Xc[0] / z) + cx
-                v = fy * (Xc[1] / z) + cy
-                u, v = apply_cylindrical_systematism_local_to_image(u, v, transfo2d)
-
-                if 0.0 <= u < width and 0.0 <= v < height:
-                    in_img += 1
-
-            z_vals = np.asarray(z_vals, dtype=np.float64)
-            zmin = float(z_vals.min()) if len(z_vals) > 0 else float("nan")
-            zmed = float(np.median(z_vals)) if len(z_vals) > 0 else float("nan")
-            zmax = float(z_vals.max()) if len(z_vals) > 0 else float("nan")
-
-            log(
-                f"[DEBUG][img {image_id}] "
-                f"z>0: {pos_z}/{sample_n_pts} | in_img: {in_img}/{sample_n_pts} | "
-                f"z(min/med/max)=({zmin:.3f}/{zmed:.3f}/{zmax:.3f}) | "
-                f"w,h=({width},{height}) fx,fy=({fx:.3f},{fy:.3f}) cx,cy=({cx:.3f},{cy:.3f})",
-                1,
-                verbose,
-            )
+    occlusion_maps = None
+    if with_occlusion:
+        log(
+            f"  Occlusion activée (radius={OCCLUSION_RADIUS_PX}px, tol_abs={OCCLUSION_TOL_ABS}, tol_rel={OCCLUSION_TOL_REL})",
+            1,
+            verbose,
+        )
+        pts_for_depth = pts_xyz[selected_indices]
+        occlusion_maps = build_occlusion_depth_maps(
+            frames=frames,
+            pts_xyz=pts_for_depth,
+            z_positive=z_positive,
+            verbose=verbose,
+        )
 
     iterable = selected_indices
     use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
@@ -563,7 +639,7 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
                 transfo2d=transfo2d,
                 z_positive=z_positive,
             )
-            
+
             if proj is None:
                 continue
 
@@ -572,6 +648,11 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
 
             if not (0.0 <= u < width and 0.0 <= v < height):
                 continue
+
+            if with_occlusion:
+                depth_map = occlusion_maps[image_id]
+                if not is_visible_with_occlusion(depth_map, u, v, depth):
+                    continue
 
             point2d_idx = len(observations_by_image[image_id])
 
@@ -602,7 +683,7 @@ def build_synthetic_observations(frames, pts_xyz, pts_rgb=None, num_terrain_poin
             1,
             verbose,
         )
-    
+
     tracked_points = sum(1 for tr in tracks_by_point if len(tr) > 0)
 
     log(
@@ -765,7 +846,18 @@ def write_cameras_txt_single_camera(path: Path, width: int, height: int, fx: flo
         f.write(f"1 PINHOLE {width} {height} {fx:.12f} {fy:.12f} {cx:.12f} {cy:.12f}\n")
 
 
-def write_images_txt(path: Path, frames, observations_by_image):
+def write_images_txt(path: Path, frames, observations_by_image, verbose: int = 1):
+    use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
+    iterable = frames
+
+    if use_tqdm:
+        iterable = tqdm(
+            frames,
+            total=len(frames),
+            desc="Écriture images.txt",
+            unit="img",
+        )
+
     with open(path, "w", encoding="utf-8") as f:
         write = f.write
 
@@ -774,7 +866,7 @@ def write_images_txt(path: Path, frames, observations_by_image):
         write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
         write(f"# Number of images: {len(frames)}\n")
 
-        for fr in frames:
+        for fr in iterable:
             q = fr["qvec"]
             t = fr["tvec"]
             image_id = fr["image_id"]
@@ -933,58 +1025,66 @@ def write_scene_normalization_json(path: Path, T4: np.ndarray, scale: float, cen
         json.dump(data, f, indent=2)
 
 
-def parse_images_txt_for_validation(path: Path):
+def parse_images_txt_for_validation(path: Path, verbose: int = 1):
     images = {}
 
     with open(path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
+    record_starts = []
     i = 0
-    while i < len(lines):
+    nlines = len(lines)
+    while i < nlines:
         line1 = lines[i].strip()
+        if line1 and not line1.startswith("#"):
+            parts = line1.split()
+            if len(parts) >= 10:
+                record_starts.append(i)
+                i += 2
+                continue
+        i += 1
 
-        if not line1 or line1.startswith("#"):
-            i += 1
-            continue
+    use_tqdm = verbose >= 1 and "tqdm" in globals() and tqdm is not None
+    iterable = record_starts
+    if use_tqdm:
+        iterable = tqdm(
+            record_starts,
+            total=len(record_starts),
+            desc="Lecture images.txt",
+            unit="img",
+        )
 
-        parts = line1.split()
-        if len(parts) < 10:
-            i += 1
-            continue
+    for i in iterable:
+        parts = lines[i].strip().split()
 
         image_id = int(parts[0])
         name = parts[9]
 
         obs = []
-        line2 = ""
-        if i + 1 < len(lines):
+        if i + 1 < nlines:
             line2 = lines[i + 1].strip()
+            if line2 and not line2.startswith("#"):
+                vals = line2.split()
+                if len(vals) % 3 != 0:
+                    raise ValueError(
+                        f"images.txt invalide: image_id={image_id}, "
+                        f"la ligne POINTS2D ne contient pas un multiple de 3 valeurs"
+                    )
 
-        if line2 and not line2.startswith("#"):
-            vals = line2.split()
-            if len(vals) % 3 != 0:
-                raise ValueError(
-                    f"images.txt invalide: image_id={image_id}, "
-                    f"la ligne POINTS2D ne contient pas un multiple de 3 valeurs"
-                )
-
-            for point2d_idx in range(len(vals) // 3):
-                x = float(vals[3 * point2d_idx + 0])
-                y = float(vals[3 * point2d_idx + 1])
-                point3d_id = int(vals[3 * point2d_idx + 2])
-
-                obs.append({
-                    "xy": (x, y),
-                    "point3d_id": point3d_id,
-                    "point2d_idx": point2d_idx,
-                })
+                nobs = len(vals) // 3
+                obs = [
+                    {
+                        "xy": (float(vals[3 * k]), float(vals[3 * k + 1])),
+                        "point3d_id": int(vals[3 * k + 2]),
+                        "point2d_idx": k,
+                    }
+                    for k in range(nobs)
+                ]
 
         images[image_id] = {
             "name": name,
             "observations": obs,
         }
-
-        i += 2
 
     return images
 
@@ -1063,7 +1163,7 @@ def try_write_colmap_bin(sparse_dir: Path, verbose: int):
 
 
 def validate_colmap_text_model(images_txt: Path, points3d_txt: Path, verbose: int = 1):
-    images = parse_images_txt_for_validation(images_txt)
+    images = parse_images_txt_for_validation(images_txt, verbose=verbose)
     points = parse_points3d_txt_for_validation(points3d_txt)
 
     errors = []
@@ -1176,10 +1276,12 @@ def main():
                     help="Remappe les POINT3D_ID en [1..N_kept]. Par défaut désactivé (IDs originaux conservés).")
     ap.add_argument("--z-negative", action="store_true",
                     help="Utilise la convention profondeur z<0 (par défaut: z>0).")
+    ap.add_argument("--with-occlusion", action="store_true",
+                    help="Active le filtrage d'occlusion (z-buffer local). Désactivé par défaut.")
     ap.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                     help="0=silencieux, 1=info, 2=warn+info")
     args = ap.parse_args()
-    
+
     t0 = time.perf_counter()
     dt_start = datetime.now()
     log(f"[TIME] Début: {dt_start.strftime('%Y-%m-%d %H:%M:%S')}", 1, args.verbose)
@@ -1197,9 +1299,10 @@ def main():
     out_models_0 = out_sparse / "models" / "0"
     sparse_pc_ply = out_dir / "sparse_pc.ply"
     normalization_json = out_dir / "scene_normalization.json"
-    
+
     z_positive = not args.z_negative
     log(f"[CONFIG] z_positive={z_positive}", 1, args.verbose)
+    log(f"[CONFIG] with_occlusion={args.with_occlusion}", 1, args.verbose)
 
     for d in [out_images, out_sparse, out_models_0]:
         ensure_dir(d)
@@ -1279,13 +1382,6 @@ def main():
             "transfo2d": transfo2d_scaled,
         })
 
-        if transfo2d_scaled is not None:
-            log(
-                f"  {con_path.name}: transfo2d appliqué = {transfo2d_scaled}",
-                1,
-                args.verbose,
-            )
-
     log(f"  Total images avec .CON retenues: {len(frames)}", 1, args.verbose)
     if skipped_no_con > 0:
         log(f"  Images ignorées faute de .CON: {skipped_no_con}", 1, args.verbose)
@@ -1323,6 +1419,7 @@ def main():
         num_terrain_points=args.num_terrain_points,
         z_positive=z_positive,
         verbose=args.verbose,
+        with_occlusion=args.with_occlusion,
     )
 
     pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_by_image, old_to_new_point_id, point3d_ids_kept = filter_points_with_tracks(
@@ -1377,20 +1474,7 @@ def main():
     applied_transform = get_nerfstudio_axis_transform_4x4()
     applied_scale = 1.0
 
-    log(f"  applied_scale = {applied_scale:.12f}", 2, args.verbose)
-    log(f"  applied_transform =\n{applied_transform}", 2, args.verbose)
-
     pts_xyz_kept_ns = apply_transform_to_points(pts_xyz_kept, applied_transform, applied_scale)
-
-    if len(pts_xyz_kept) > 0:
-        log(
-            f"  Emprise points exportés: "
-            f"x=[{pts_xyz_kept[:,0].min():.3f}, {pts_xyz_kept[:,0].max():.3f}] "
-            f"y=[{pts_xyz_kept[:,1].min():.3f}, {pts_xyz_kept[:,1].max():.3f}] "
-            f"z=[{pts_xyz_kept[:,2].min():.3f}, {pts_xyz_kept[:,2].max():.3f}]",
-            1,
-            args.verbose,
-        )
 
     write_scene_normalization_json(
         normalization_json,
@@ -1401,7 +1485,7 @@ def main():
 
     log("[8/8] Écriture COLMAP, sparse_pc.ply, transforms.json + conversion binaire...", 1, args.verbose)
     write_cameras_txt_single_camera(out_sparse / "cameras.txt", width, height, fx, fy, cx, cy)
-    write_images_txt(out_sparse / "images.txt", frames, observations_by_image)
+    write_images_txt(out_sparse / "images.txt", frames, observations_by_image, verbose=args.verbose)
     write_points3D_txt(
         out_sparse / "points3D.txt",
         pts_xyz_kept,
@@ -1410,7 +1494,7 @@ def main():
         point3d_ids=point3d_ids_kept,
         verbose=args.verbose,
     )
-    write_ply_xyzrgb(sparse_pc_ply, pts_xyz_kept_ns, pts_rgb_kept)
+    write_ply_xyzrgb(sparse_pc_ply, pts_xyz_kept_ns, pts_rgb_kept, verbose=args.verbose)
 
     build_transforms_json(
         out_dir / "transforms.json",
@@ -1426,7 +1510,6 @@ def main():
             txt_path = out_sparse / txt_name
             try:
                 txt_path.unlink()
-                log(f"[INFO] Supprimé après conversion binaire: {txt_path}", 1, args.verbose)
             except FileNotFoundError:
                 pass
             except Exception as e:
@@ -1439,7 +1522,7 @@ def main():
     print(f"Sparse PLY Nerfstudio: {sparse_pc_ply}")
     print(f"Transforms Nerfstudio: {out_dir / 'transforms.json'}")
     print(f"Normalisation: {normalization_json}")
-    
+
     dt_end = datetime.now()
     elapsed_s = time.perf_counter() - t0
 
