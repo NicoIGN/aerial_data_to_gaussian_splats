@@ -15,9 +15,9 @@ TRAIN_VIS_MODE="tensorboard"
 
 # ⚠️ CRITIQUE pour débloquer la densification
 CAMERA_RES_SCALE_FACTOR=1
-MAX_RES=4096
+MAX_RES=8092
 
-NUM_DOWNSCALES=1
+NUM_DOWNSCALES=0
 SKIP_IMAGE_PROCESSING=true
 
 ########################################
@@ -25,7 +25,7 @@ SKIP_IMAGE_PROCESSING=true
 ########################################
 
 # ⚠️ CRITIQUE (temps de densification)
-MAX_ITER=6000
+MAX_ITER=8000
 
 # 🛑 STOP SPLIT PLUS TÔT
 # STOP_SPLIT_AT=6000            # ↓ stop plus tôt (important)
@@ -67,7 +67,7 @@ CULL_SCALE_THRESH=0.5         # ↓ supprime petits clusters instables
 USE_BILATERAL_GRID=true
 USE_SCALE_REGULARIZATION=False
 
-MAX_GAUSS_RATIO=4.0          # ↓ limite taille splats
+MAX_GAUSS_RATIO=40.0          # ↓ limite taille splats
 SSIM_LAMBDA=0.25             # léger boost stabilité image (optionnel)
 
 ########################################

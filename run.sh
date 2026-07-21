@@ -380,7 +380,7 @@ else
           # -----------------------------
           CAMERA_RES_SCALE_FACTOR="0.5"
           NUM_DOWNSCALES="2"
-          MAX_RES="1024"
+          MAX_RES="8192"
           RELOAD_FROM_CHECKPOINT="False"
 
           echo "🧩 Stage coarse: SCALE=$CAMERA_RES_SCALE_FACTOR DOWNSCALE=$NUM_DOWNSCALES"
