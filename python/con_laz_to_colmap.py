@@ -584,7 +584,8 @@ def build_synthetic_observations(
     verbose=1,
     z_positive=True,
     with_occlusion=False,
-    occlusion_radius=2
+    occlusion_radius=2,
+    occlusion_pts_xyz=None,
 ):
     num_pts_total = len(pts_xyz)
 
@@ -623,7 +624,18 @@ def build_synthetic_observations(
             1,
             verbose,
         )
-        pts_for_depth = pts_xyz[selected_indices]
+
+        if occlusion_pts_xyz is None:
+            pts_for_depth = pts_xyz
+        else:
+            pts_for_depth = occlusion_pts_xyz
+
+        log(
+            f"  Construction des depth maps d'occlusion avec {len(pts_for_depth)} point(s)",
+            1,
+            verbose,
+        )
+
         occlusion_maps = build_occlusion_depth_maps(
             frames=frames,
             pts_xyz=pts_for_depth,
@@ -1420,23 +1432,33 @@ def main():
 
     width, height, fx, fy, cx, cy = intrinsics_ref
 
-    log("[3/8] Lecture et sous-échantillonnage du LAZ...", 1, args.verbose)
-    pts_xyz_raw, pts_rgb = read_laz_points(laz_path, args.subsample)
-    log(f"  {len(pts_xyz_raw)} points conservés après sous-échantillonnage initial.", 1, args.verbose)
+    log("[3/8] Lecture complète du LAZ pour l'occlusion...", 1, args.verbose)
+    pts_xyz_full_bbox, pts_rgb_full_bbox = read_laz_points(laz_path, 1)
+    log(f"  {len(pts_xyz_full_bbox)} points chargés sans sous-échantillonnage.", 1, args.verbose)
 
     bbox_enabled = any(v is not None for v in (args.xmin, args.xmax, args.ymin, args.ymax))
     if bbox_enabled:
-        log("[3b/8] Filtrage du LAZ par bbox XY...", 1, args.verbose)
-        before_bbox = len(pts_xyz_raw)
-        pts_xyz_raw, pts_rgb = filter_xy_bbox(
-            pts_xyz_raw, pts_rgb,
+        log("[3b/8] Filtrage du LAZ complet par bbox XY...", 1, args.verbose)
+        before_bbox = len(pts_xyz_full_bbox)
+        pts_xyz_full_bbox, pts_rgb_full_bbox = filter_xy_bbox(
+            pts_xyz_full_bbox, pts_rgb_full_bbox,
             xmin=args.xmin, xmax=args.xmax,
             ymin=args.ymin, ymax=args.ymax,
         )
-        log(f"  {len(pts_xyz_raw)}/{before_bbox} points conservés dans la bbox.", 1, args.verbose)
+        log(f"  {len(pts_xyz_full_bbox)}/{before_bbox} points conservés dans la bbox pour l'occlusion.", 1, args.verbose)
+
+    if len(pts_xyz_full_bbox) == 0:
+        print("Aucun point LAZ conservé après filtrage bbox pour l'occlusion.")
+        sys.exit(4)
+
+    log("[3c/8] Sous-échantillonnage du LAZ pour l'export...", 1, args.verbose)
+    stride = max(1, int(args.subsample))
+    pts_xyz_raw = pts_xyz_full_bbox[::stride]
+    pts_rgb = None if pts_rgb_full_bbox is None else pts_rgb_full_bbox[::stride]
+    log(f"  {len(pts_xyz_raw)} points conservés pour l'export après subsample={stride}.", 1, args.verbose)
 
     if len(pts_xyz_raw) == 0:
-        print("Aucun point LAZ conservé après filtrage.")
+        print("Aucun point LAZ conservé pour l'export après sous-échantillonnage.")
         sys.exit(4)
 
     log("[4/8] Génération des observations synthétiques (repère COLMAP source)...", 1, args.verbose)
@@ -1449,6 +1471,7 @@ def main():
         verbose=args.verbose,
         with_occlusion=args.with_occlusion,
         occlusion_radius=occlusion_radius,
+        occlusion_pts_xyz=pts_xyz_full_bbox,
     )
 
     pts_xyz_kept, pts_rgb_kept, tracks_kept, observations_by_image, old_to_new_point_id, point3d_ids_kept = filter_points_with_tracks(
