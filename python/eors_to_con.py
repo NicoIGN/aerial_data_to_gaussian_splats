@@ -16,7 +16,6 @@ from con_camera_lib import (
     prettify_xml,
 )
 
-# ---------------------------------------------------------------------------
 IMAGE_EXTS = re.compile(r"\.(jpe?g|tiff?|png|bmp|jp2)$", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
@@ -49,12 +48,10 @@ FLIPS = {
     for sx,sy,sz in product([1,-1], repeat=3)
 }
 
-# Convention obs paramétrée par height (connu au moment de l'appel)
-# obs(c, h-l) : passage repère direct → repère image indirect (.CON)
 def make_obs_convs(height: int):
     h = float(height)
     return {
-        "obs(c,h-l)": lambda c, l: (c, h - l),   # ← bonne convention physique
+        "obs(c,h-l)": lambda c, l: (c, h - l),
         "obs(c,l)":   lambda c, l: (c, l),
         "obs(c,-l)":  lambda c, l: (c, -l),
     }
@@ -206,29 +203,35 @@ def build_calib_dataset(eors_df, tp3d, by_obs,
 
 
 # ---------------------------------------------------------------------------
-# Fit pinhole linéaire
+# Fit pinhole — avec vérification PPA dans l'image
 # ---------------------------------------------------------------------------
 
-def fit_pinhole(data):
+def fit_pinhole(data, width=None, height=None):
     xn, yn, u_obs, v_obs = data[:,0], data[:,1], data[:,2], data[:,3]
     N = len(xn)
     A = np.zeros((2*N, 3), dtype=np.float64)
-    b = np.zeros(2*N,      dtype=np.float64)
-    A[:N,0]=1.0;  A[:N,2]=xn;  b[:N]=u_obs
-    A[N:,1]=1.0;  A[N:,2]=yn;  b[N:]=v_obs
+    b = np.zeros(2*N, dtype=np.float64)
+    A[:N,0]=1.0; A[:N,2]=xn; b[:N]=u_obs
+    A[N:,1]=1.0; A[N:,2]=yn; b[N:]=v_obs
     x, *_ = np.linalg.lstsq(A, b, rcond=None)
-    ppa_c, ppa_l, f = x
+    ppa_c, ppa_l, f = float(x[0]), float(x[1]), float(x[2])
     res_u = u_obs - (ppa_c + f*xn)
     res_v = v_obs - (ppa_l + f*yn)
-    err   = np.sqrt(res_u**2 + res_v**2)
-    return float(f), float(ppa_c), float(ppa_l), float(np.sqrt(np.mean(err**2)))
+    rmse  = float(np.sqrt(np.mean(res_u**2 + res_v**2)))
+
+    # Vérification cohérence
+    valid = f > 0
+    if width  is not None: valid = valid and (0 <= ppa_c <= width)
+    if height is not None: valid = valid and (0 <= ppa_l <= height)
+
+    return f, ppa_c, ppa_l, rmse, valid
 
 
 # ---------------------------------------------------------------------------
-# Recherche convention
+# Recherche convention — ne garde que les conventions avec PPA dans l'image
 # ---------------------------------------------------------------------------
 
-def search_best_convention(eors_df, tp3d, by_obs, height,
+def search_best_convention(eors_df, tp3d, by_obs, width, height,
                             search_max_pts=50, rmse_threshold=100.0):
     obs_convs = make_obs_convs(height)
     results = []
@@ -239,33 +242,32 @@ def search_best_convention(eors_df, tp3d, by_obs, height,
         for flip_name, flip_mat in FLIPS.items():
             for obs_name, obs_fn in obs_convs.items():
                 data = build_calib_dataset(
-                    eors_df, tp3d, by_obs,
-                    rot_fn, flip_mat, obs_fn,
+                    eors_df, tp3d, by_obs, rot_fn, flip_mat, obs_fn,
                     max_pts_per_image=search_max_pts,
                 )
                 done += 1
                 rmse = float("inf")
                 if data is not None and len(data) >= 10:
-                    f_val, _, _, rmse = fit_pinhole(data)
-                    if f_val < 0:
-                        rmse = float("inf")  # focale négative → invalide
+                    f_val, pc, pl, rmse, valid = fit_pinhole(data, width, height)
+                    if not valid:
+                        rmse = float("inf")
                 results.append((rmse, rot_name, flip_name, obs_name))
+                best = min(results)
                 print(f"\r  {done}/{total}  best: "
-                      f"{min(results)[1]}+{min(results)[2]}+{min(results)[3]} "
-                      f"rmse={min(results)[0]:.2f}px    ",
+                      f"{best[1]}+{best[2]}+{best[3]} "
+                      f"rmse={best[0]:.2f}px    ",
                       end="", flush=True)
 
     print()
     results.sort()
 
     print("\n" + "=" * 65)
-    print("CLASSEMENT PINHOLE (top 10, sans distorsion, f > 0 uniquement)")
+    print("CLASSEMENT PINHOLE (top 10, f>0 et PPA dans l'image)")
     print("=" * 65)
     print(f"{'#':>3}  {'rotation':>10}  {'flip':>8}  {'obs':>12}  {'rmse':>8}")
     print("-" * 65)
     for i, (rmse, rot, flip, obs) in enumerate(results[:10], 1):
-        mark = "" if rmse < float("inf") else "  (f<0)"
-        print(f"{i:>3}  {rot:>10}  {flip:>8}  {obs:>12}  {rmse:>8.3f}px{mark}")
+        print(f"{i:>3}  {rot:>10}  {flip:>8}  {obs:>12}  {rmse:>8.3f}px")
     print("=" * 65)
 
     best_rmse, best_rot, best_flip, best_obs = results[0]
@@ -276,7 +278,7 @@ def search_best_convention(eors_df, tp3d, by_obs, height,
     if best_rmse > rmse_threshold:
         raise RuntimeError(
             f"RMSE pinhole = {best_rmse:.2f}px > seuil {rmse_threshold}px.\n"
-            f"Aucune convention valide (f>0) trouvée sous le seuil.\n"
+            f"Aucune convention valide (f>0, PPA dans image) trouvée.\n"
             f"Vérifiez le système de coordonnées ou la qualité du tp3d."
         )
 
@@ -285,79 +287,6 @@ def search_best_convention(eors_df, tp3d, by_obs, height,
             obs_convs_full[best_obs],
             best_rot, best_flip, best_obs, best_rmse)
 
-
-# ---------------------------------------------------------------------------
-# Fit PPS
-# ---------------------------------------------------------------------------
-
-def fit_pps_grid(data, f, ppa_c, ppa_l, search_radius=300.0, step=20.0):
-    xn, yn, u_obs, v_obs = data[:,0], data[:,1], data[:,2], data[:,3]
-    u0 = ppa_c + f * xn;  v0 = ppa_l + f * yn
-    offsets = np.arange(-search_radius, search_radius + step*0.5, step)
-    best_score = float("inf")
-    best_dc, best_dl = 0.0, 0.0
-    for dc in offsets:
-        for dl in offsets:
-            pps_c = ppa_c + dc;  pps_l = ppa_l + dl
-            du = u0 - pps_c;  dv = v0 - pps_l
-            R  = np.sqrt(du**2 + dv**2)
-            valid = R > 1.0
-            if not np.any(valid):
-                continue
-            ru = (u_obs - u0)[valid]; rv = (v_obs - v0)[valid]
-            tang = (-dv[valid]*ru + du[valid]*rv) / R[valid]
-            score = float(np.mean(tang**2))
-            if score < best_score:
-                best_score = score
-                best_dc, best_dl = dc, dl
-    return ppa_c + best_dc, ppa_l + best_dl, best_score
-
-
-def refine_pps(data, f, ppa_c, ppa_l, pps_c0, pps_l0, num_iter=20):
-    xn, yn, u_obs, v_obs = data[:,0], data[:,1], data[:,2], data[:,3]
-    u0 = ppa_c + f * xn;  v0 = ppa_l + f * yn
-    pps_c, pps_l = pps_c0, pps_l0
-    for _ in range(num_iter):
-        du = u0 - pps_c;  dv = v0 - pps_l
-        R  = np.sqrt(du**2 + dv**2)
-        valid = R > 1.0
-        ru = (u_obs - u0)[valid]; rv = (v_obs - v0)[valid]
-        tang = (-dv[valid]*ru + du[valid]*rv) / R[valid]
-        duv = du[valid]; dvv = dv[valid]; Rv = R[valid]
-        J_pc = ( dvv*ru - duv*rv) / Rv
-        J_pl = (-dvv*rv - duv*ru) / Rv
-        JtJ  = np.array([[np.sum(J_pc**2),    np.sum(J_pc*J_pl)],
-                          [np.sum(J_pc*J_pl),  np.sum(J_pl**2)  ]])
-        Jtr  = np.array([np.sum(J_pc*tang), np.sum(J_pl*tang)])
-        try:
-            delta = np.linalg.solve(JtJ + 1e-6*np.eye(2), Jtr)
-        except np.linalg.LinAlgError:
-            break
-        pps_c -= delta[0];  pps_l -= delta[1]
-    return float(pps_c), float(pps_l)
-
-
-# ---------------------------------------------------------------------------
-# Fit distorsion radiale
-# ---------------------------------------------------------------------------
-
-def fit_distortion(data, f, ppa_c, ppa_l, pps_c, pps_l):
-    xn, yn, u_obs, v_obs = data[:,0], data[:,1], data[:,2], data[:,3]
-    u0 = ppa_c + f*xn;  v0 = ppa_l + f*yn
-    du = u0 - pps_c;  dv = v0 - pps_l
-    R2 = (du**2 + dv**2) / (f*f)
-    rhs_u = (u_obs - pps_c) - du
-    rhs_v = (v_obs - pps_l) - dv
-    N = len(xn)
-    A = np.zeros((2*N, 4), dtype=np.float64)
-    rhs = np.zeros(2*N, dtype=np.float64)
-    for j, power in enumerate([1, 2, 3, 4]):
-        Rp = R2**power
-        A[:N, j] = du*Rp;  A[N:, j] = dv*Rp
-    rhs[:N] = rhs_u;  rhs[N:] = rhs_v
-    lam = 1e-4
-    coeffs, *_ = np.linalg.lstsq(A.T@A + lam*np.eye(4), A.T@rhs, rcond=None)
-    return coeffs
 
 
 # ---------------------------------------------------------------------------
@@ -420,8 +349,8 @@ def compute_residuals(eors_df, tp3d, by_obs, con_intr,
             if proj is None:
                 n_behind += 1; continue
             u_ref, v_ref = obs_fn(float(c_obs), float(l_obs))
-            dc = u_ref - proj[0];  dl = v_ref - proj[1]
-            dc_img.append(dc);  dl_img.append(dl)
+            dc = u_ref - proj[0]; dl = v_ref - proj[1]
+            dc_img.append(dc); dl_img.append(dl)
             err_img.append(math.sqrt(dc*dc + dl*dl))
 
         entry = {"stem": stem, "n_obs": len(obs_rows),
@@ -458,6 +387,220 @@ def compute_residuals(eors_df, tp3d, by_obs, con_intr,
         }
     return per_image, global_stats
 
+def fit_all_intrinsics(data, f0, ppa_c0, ppa_l0,
+                        pps_search_radius=300.0, pps_search_step=10.0,
+                        gn_iters=50, verbose=True):
+    """
+    Fit séquencé :
+      1. PPS par critère tangentiel (grille + GN 2 params), f/ppa fixés
+      2. Fit linéaire r3,r5,r7 (r1=0, PPS fixé)
+      3. Fit linéaire r1 seul (r3,r5,r7 fixés)
+      4. GN conjoint 9 params [f, ppa_c, ppa_l, pps_dc, pps_dl, r1, r3, r5, r7]
+    """
+    xn, yn, u_obs, v_obs = data[:,0], data[:,1], data[:,2], data[:,3]
+    N = len(xn)
+
+    # ------------------------------------------------------------------
+    # Étape 1 : PPS par critère tangentiel
+    # ------------------------------------------------------------------
+    u0    = ppa_c0 + f0 * xn
+    v0    = ppa_l0 + f0 * yn
+    ru_ph = u_obs - u0
+    rv_ph = v_obs - v0
+
+    offsets = np.arange(-pps_search_radius,
+                         pps_search_radius + pps_search_step*0.5,
+                         pps_search_step)
+    best_score = float("inf")
+    best_dc, best_dl = 0.0, 0.0
+    for dc in offsets:
+        for dl in offsets:
+            du = u0 - (ppa_c0 + dc);  dv = v0 - (ppa_l0 + dl)
+            R  = np.sqrt(du**2 + dv**2)
+            valid = R > 1.0
+            if not np.any(valid):
+                continue
+            tang  = (-dv[valid]*ru_ph[valid] + du[valid]*rv_ph[valid]) / R[valid]
+            score = float(np.mean(tang**2))
+            if score < best_score:
+                best_score = score;  best_dc, best_dl = dc, dl
+
+    pps_c = ppa_c0 + best_dc;  pps_l = ppa_l0 + best_dl
+    if verbose:
+        print(f"  [1-PPS grille]  offset=({best_dc:+.1f},{best_dl:+.1f})px")
+
+    for _ in range(50):
+        du = u0 - pps_c;  dv = v0 - pps_l
+        R  = np.sqrt(du**2 + dv**2);  valid = R > 1.0
+        tang = (-dv[valid]*ru_ph[valid] + du[valid]*rv_ph[valid]) / R[valid]
+        duv = du[valid];  dvv = dv[valid];  Rv = R[valid]
+        J_pc = ( dvv*ru_ph[valid] - duv*rv_ph[valid]) / Rv
+        J_pl = (-dvv*rv_ph[valid] - duv*ru_ph[valid]) / Rv
+        JtJ  = np.array([[np.sum(J_pc**2),   np.sum(J_pc*J_pl)],
+                          [np.sum(J_pc*J_pl), np.sum(J_pl**2)  ]])
+        Jtr  = np.array([np.sum(J_pc*tang), np.sum(J_pl*tang)])
+        try:
+            delta = np.linalg.solve(JtJ + 1e-8*np.eye(2), Jtr)
+        except np.linalg.LinAlgError:
+            break
+        if np.linalg.norm(delta) < 1e-4:
+            break
+        pps_c -= delta[0];  pps_l -= delta[1]
+
+    if verbose:
+        print(f"  [1-PPS affiné]  pps=({pps_c:.3f},{pps_l:.3f})  "
+              f"offset=({pps_c-ppa_c0:+.3f},{pps_l-ppa_l0:+.3f})px")
+
+    # ------------------------------------------------------------------
+    # Étape 2 : fit linéaire r3,r5,r7 (r1=0, PPS fixé)
+    # ------------------------------------------------------------------
+    du = u0 - pps_c;  dv = v0 - pps_l
+    R2 = (du**2 + dv**2) / (f0*f0)
+
+    rhs_u = (u_obs - pps_c) - du
+    rhs_v = (v_obs - pps_l) - dv
+    A2 = np.zeros((2*N, 3), dtype=np.float64)
+    b2 = np.zeros(2*N, dtype=np.float64)
+    for j, power in enumerate([2, 3, 4]):
+        Rp = R2**power
+        A2[:N,j] = du*Rp;  A2[N:,j] = dv*Rp
+    b2[:N] = rhs_u;  b2[N:] = rhs_v
+    c357, *_ = np.linalg.lstsq(A2, b2, rcond=None)
+    r3, r5, r7 = float(c357[0]), float(c357[1]), float(c357[2])
+    if verbose:
+        print(f"  [2-r3,r5,r7]    r3={r3:.4e}  r5={r5:.4e}  r7={r7:.4e}")
+
+    # ------------------------------------------------------------------
+    # Étape 3 : fit linéaire r1 seul (r3,r5,r7 fixés)
+    # résidu après r3,r5,r7 ≈ du*r1*R2  +  dv*r1*R2
+    # ------------------------------------------------------------------
+    scale_357   = r3*R2**2 + r5*R2**3 + r7*R2**4
+    u_after_357 = pps_c + du*(1.0 + scale_357)
+    v_after_357 = pps_l + dv*(1.0 + scale_357)
+    resid_u = u_obs - u_after_357
+    resid_v = v_obs - v_after_357
+    A1  = np.concatenate([du*R2, dv*R2])
+    b1  = np.concatenate([resid_u, resid_v])
+    r1  = float(np.dot(A1, b1) / (np.dot(A1, A1) + 1e-12))
+
+    if verbose:
+        scale_all = 1.0 + r1*R2 + r3*R2**2 + r5*R2**3 + r7*R2**4
+        u_p = pps_c + du*scale_all;  v_p = pps_l + dv*scale_all
+        err = np.sqrt((u_obs-u_p)**2 + (v_obs-v_p)**2)
+        print(f"  [3-r1]          r1={r1:.4e}  "
+              f"rmse après init={np.sqrt(np.mean(err**2)):.4f}px")
+
+    # ------------------------------------------------------------------
+    # Étape 4 : GN conjoint 9 paramètres
+    # theta = [f, ppa_c, ppa_l, pps_dc, pps_dl, r1, r3, r5, r7]
+    # ------------------------------------------------------------------
+    theta = np.array([f0, ppa_c0, ppa_l0,
+                       pps_c - ppa_c0, pps_l - ppa_l0,
+                       r1, r3, r5, r7], dtype=np.float64)
+
+    def _pred(th):
+        _f   = th[0];  _pc  = th[1];  _pl  = th[2]
+        _dc  = th[3];  _dl  = th[4]
+        _r1  = th[5];  _r3  = th[6];  _r5  = th[7];  _r7 = th[8]
+        _pps_c = _pc + _dc;  _pps_l = _pl + _dl
+        _u0  = _pc + _f * xn;  _v0 = _pl + _f * yn
+        _du  = _u0 - _pps_c;   _dv = _v0 - _pps_l
+        _R2  = (_du**2 + _dv**2) / (_f*_f)
+        _sc  = 1.0 + _r1*_R2 + _r3*_R2**2 + _r5*_R2**3 + _r7*_R2**4
+        return _pps_c + _du*_sc, _pps_l + _dv*_sc
+
+    def _res(th):
+        up, vp = _pred(th)
+        return np.concatenate([u_obs - up, v_obs - vp])
+
+    best_theta = theta.copy()
+    best_rmse  = float("inf")
+    prev_rmse  = float("inf")
+    eps = 1e-5
+
+    for it in range(gn_iters):
+        res  = _res(theta)
+        rmse = float(np.sqrt(np.mean(res**2)))
+
+        if rmse < best_rmse:
+            best_rmse = rmse;  best_theta = theta.copy()
+
+        if verbose:
+            print(f"  [4-GN iter {it:2d}] rmse={rmse:.4f}px  "
+                  f"f={theta[0]:.2f}  "
+                  f"ppa=({theta[1]:.1f},{theta[2]:.1f})  "
+                  f"pps_d=({theta[3]:+.1f},{theta[4]:+.1f})  "
+                  f"r1={theta[5]:.3e}  r3={theta[6]:.3e}")
+
+        if abs(prev_rmse - rmse) < 1e-6:
+            if verbose:
+                print(f"  [4-GN converged iter {it}]")
+            break
+        prev_rmse = rmse
+
+        # Jacobienne diff. finies
+        npar = len(theta)
+        J = np.zeros((2*N, npar), dtype=np.float64)
+        for j in range(npar):
+            tp = theta.copy(); tp[j] += eps
+            tm = theta.copy(); tm[j] -= eps
+            up_p, vp_p = _pred(tp);  up_m, vp_m = _pred(tm)
+            J[:N, j] = (up_p - up_m) / (2*eps)
+            J[N:, j] = (vp_p - vp_m) / (2*eps)
+
+        JtJ = J.T @ J
+        Jtr = J.T @ res   # résidu = obs - pred
+
+        # Régularisation : quasi-nulle sur géométrie, légère sur distorsion
+        reg = np.array([1e-8, 1e-8, 1e-8,   # f, ppa_c, ppa_l
+                         1e-8, 1e-8,          # pps_dc, pps_dl
+                         1e-6, 1e-6, 1e-6, 1e-6])  # r1,r3,r5,r7
+        JtJ += np.diag(reg)
+
+        try:
+            delta = np.linalg.solve(JtJ, Jtr)
+        except np.linalg.LinAlgError:
+            break
+
+        # Pas limité par paramètre
+        max_steps = np.array([50.0, 20.0, 20.0,   # f, ppa_c, ppa_l
+                               20.0, 20.0,          # pps_dc, pps_dl
+                               1e-2, 1e-2, 1e-2, 1e-2])  # ri
+        delta = np.clip(delta, -max_steps, max_steps)
+
+        theta = theta + delta
+
+    theta = best_theta
+    up, vp = _pred(theta)
+    err = np.sqrt((u_obs-up)**2 + (v_obs-vp)**2)
+    stats = {
+        "rmse":     float(np.sqrt(np.mean(err**2))),
+        "mean_err": float(np.mean(err)),
+        "med_err":  float(np.median(err)),
+        "p95_err":  float(np.percentile(err, 95)),
+        "max_err":  float(np.max(err)),
+        "n":        N,
+    }
+
+    f_out    = float(theta[0])
+    ppa_c_out = float(theta[1]);  ppa_l_out = float(theta[2])
+    pps_c_out = float(theta[1] + theta[3])
+    pps_l_out = float(theta[2] + theta[4])
+    r1_out, r3_out, r5_out, r7_out = (float(theta[5]), float(theta[6]),
+                                       float(theta[7]), float(theta[8]))
+
+    if verbose:
+        print(f"\n  [résultat final]")
+        print(f"    f={f_out:.4f}  ppa=({ppa_c_out:.3f},{ppa_l_out:.3f})")
+        print(f"    pps=({pps_c_out:.3f},{pps_l_out:.3f})  "
+              f"offset=({pps_c_out-ppa_c_out:+.3f},{pps_l_out-ppa_l_out:+.3f})px")
+        print(f"    r1={r1_out:.6e}  r3={r3_out:.6e}  "
+              f"r5={r5_out:.6e}  r7={r7_out:.6e}")
+        print(f"    rmse={stats['rmse']:.4f}px  p95={stats['p95_err']:.4f}px  "
+              f"max={stats['max_err']:.4f}px")
+
+    return f_out, ppa_c_out, ppa_l_out, pps_c_out, pps_l_out, \
+           r1_out, r3_out, r5_out, r7_out, stats
 
 def print_residuals(per_image, global_stats, title="RÉSIDUS"):
     W = 78
@@ -504,13 +647,13 @@ def main():
     ap.add_argument("--geodesic",          default="LAMBERT93")
     ap.add_argument("--reference-label",   default=None)
     ap.add_argument("--rmse-threshold",    type=float, default=100.0)
-    ap.add_argument("--pps-search-radius", type=float, default=300.0)
-    ap.add_argument("--pps-search-step",   type=float, default=20.0)
     ap.add_argument("--max-pts-per-image", type=int,   default=0)
     ap.add_argument("--search-max-pts",    type=int,   default=50)
-    ap.add_argument("--no-distortion",     action="store_true",
-                    help="Ne fit pas la distorsion, écrit les .CON pinhole seul.")
+    ap.add_argument("--no-distortion",     action="store_true")
     ap.add_argument("--verify-only",       action="store_true")
+    ap.add_argument("--pps-search-radius", type=float, default=300.0)
+    ap.add_argument("--pps-search-step",   type=float, default=10.0)
+    ap.add_argument("--gn-iters",          type=int,   default=50)
     args = ap.parse_args()
 
     eors_path  = Path(args.eors)
@@ -540,18 +683,18 @@ def main():
     width, height  = get_image_size(ref_image_path)
     print(f"[INFO] Taille image : {width}x{height}")
 
-    # 1. Recherche convention (avec obs(c, h-l) dans les candidats)
+    # 1. Recherche convention (f>0, PPA dans l'image)
     print(f"\n[INFO] Recherche convention "
           f"({len(ROTATION_ORDERS)*len(FLIPS)*len(make_obs_convs(height))} hypothèses)...")
     rot_fn, flip, obs_fn, rot_name, flip_name, obs_name, _ = \
         search_best_convention(
-            eors_df, tp3d, by_obs, height,
+            eors_df, tp3d, by_obs, width, height,
             search_max_pts=args.search_max_pts,
             rmse_threshold=args.rmse_threshold,
         )
 
     # 2. Pinhole complet
-    print(f"\n[INFO] Fit pinhole complet ({rot_name}+{flip_name}+{obs_name})...")
+    print(f"\n[INFO] Fit pinhole ({rot_name}+{flip_name}+{obs_name})...")
     calib_data = build_calib_dataset(
         eors_df, tp3d, by_obs, rot_fn, flip, obs_fn,
         max_pts_per_image=args.max_pts_per_image,
@@ -560,14 +703,14 @@ def main():
         raise RuntimeError("Aucune observation exploitable.")
     print(f"[INFO] {len(calib_data)} observations")
 
-    f, ppa_c, ppa_l, rmse_pinhole = fit_pinhole(calib_data)
+    f, ppa_c, ppa_l, rmse_ph, valid = fit_pinhole(calib_data, width, height)
     print(f"[INFO] Pinhole : f={f:.4f}  ppa=({ppa_c:.4f},{ppa_l:.4f})  "
-          f"rmse={rmse_pinhole:.4f}px")
+          f"rmse={rmse_ph:.4f}px  valid={valid}")
 
-    if f <= 0:
+    if not valid:
         raise RuntimeError(
-            f"Focale négative (f={f:.2f}) après normalisation.\n"
-            f"Convention '{rot_name}+{flip_name}+{obs_name}' incohérente."
+            f"Pinhole invalide : f={f:.2f}, ppa=({ppa_c:.1f},{ppa_l:.1f})\n"
+            f"PPA hors image ou focale négative."
         )
 
     con_pinhole = {
@@ -584,28 +727,24 @@ def main():
 
     if args.no_distortion:
         con_intr = con_pinhole
-        print("[INFO] --no-distortion : pas de fit distorsion.")
     else:
-        # 3. PPS
-        print(f"[INFO] Recherche PPS "
-              f"(rayon={args.pps_search_radius}px, pas={args.pps_search_step}px)...")
-        pps_c, pps_l, score = fit_pps_grid(
-            calib_data, f, ppa_c, ppa_l,
-            search_radius=args.pps_search_radius,
-            step=args.pps_search_step,
-        )
-        pps_c, pps_l = refine_pps(calib_data, f, ppa_c, ppa_l, pps_c, pps_l)
-        print(f"[INFO] PPS : ({pps_c:.4f}, {pps_l:.4f})  "
-              f"offset=({pps_c-ppa_c:+.2f}, {pps_l-ppa_l:+.2f})px")
-
-        # 4. Distorsion
-        print("[INFO] Fit distorsion radiale (r1, r3, r5, r7)...")
-        r1, r3, r5, r7 = fit_distortion(calib_data, f, ppa_c, ppa_l, pps_c, pps_l)
-        print(f"[INFO] r1={r1:.6e}  r3={r3:.6e}  r5={r5:.6e}  r7={r7:.6e}")
+        print(f"\n[INFO] Calibration complète "
+              f"(PPA+PPS+r1+r3+r5+r7, {args.gn_iters} iters GN)...")
+        f_cal, ppa_c, ppa_l, pps_c, pps_l, r1, r3, r5, r7, stats = \
+            fit_all_intrinsics(
+                calib_data, f, ppa_c, ppa_l,
+                pps_search_radius=args.pps_search_radius,
+                pps_search_step=args.pps_search_step,
+                gn_iters=args.gn_iters,
+                verbose=True,
+            )
+        print(f"[INFO] Résidus fit : "
+              f"rmse={stats['rmse']:.4f}px  p95={stats['p95_err']:.4f}px  "
+              f"max={stats['max_err']:.4f}px  n={stats['n']}")
 
         con_intr = {
             "width": width, "height": height,
-            "focal": f, "ppa_c": ppa_c, "ppa_l": ppa_l,
+            "focal": f_cal, "ppa_c": ppa_c, "ppa_l": ppa_l,
             "pps_c": pps_c, "pps_l": pps_l,
             "r1": r1, "r3": r3, "r5": r5, "r7": r7,
         }
@@ -616,7 +755,7 @@ def main():
         )
         print_residuals(per_img, gs, "RÉSIDUS FINAUX (avec distorsion)")
 
-    # 5. Écriture .CON
+    # 4. Écriture .CON
     if not args.verify_only:
         pixel_size_value = f"{float(args.pixel_size):.15e}"
         n_ok = n_skip = 0
@@ -628,8 +767,8 @@ def main():
 
             center = np.array([float(row.X0), float(row.Y0), float(row.Z0)],
                                dtype=np.float64)
-            R_cw   = build_R_cw(row.omega_deg, row.phi_deg, row.kappa_deg,
-                                 rot_fn, flip)
+            R_cw = build_R_cw(row.omega_deg, row.phi_deg, row.kappa_deg,
+                               rot_fn, flip)
             dest = out_dir / f"{stem}.CON" if out_dir is not None \
                 else image_path.parent / f"{stem}.CON"
             dest.parent.mkdir(parents=True, exist_ok=True)
