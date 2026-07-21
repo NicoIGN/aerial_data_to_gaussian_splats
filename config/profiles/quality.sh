@@ -45,18 +45,18 @@ NUM_PROPOSAL_SAMPLES_PER_RAY="128 64"
 DENSIFY_GRAD_THRESH=0.00045   # ↑ moins de split
 
 # 🧹 CLEANING (plus strict)
-CULL_ALPHA_THRESH=0.12        # ↑ supprime plus tôt les splats faibles
+CULL_ALPHA_THRESH=0.05        # ↑ supprime plus tôt les splats faibles
 
 # 📏 SPATIAL CONTROL (réduction explosion)
-CULL_SCREEN_SIZE=0.25         # ↑ plus agressif en screen-space
-SPLIT_SCREEN_SIZE=0.02        # ↑ moins de split fin
+CULL_SCREEN_SIZE=0.15         # ↑ plus agressif en screen-space
+SPLIT_SCREEN_SIZE=0.01        # ↑ moins de split fin
 
 # ⚡ DENSIFICATION FREQUENCY (moins de croissance)
-REFINE_EVERY=300              # ↑ réduit création de nouveaux splats
+REFINE_EVERY=500              # ↑ réduit création de nouveaux splats
 
 
 # 🧠 STABILISATION (évite accumulation de bruit)
-RESET_ALPHA_EVERY=40          # ↑ nettoyage plus fréquent
+RESET_ALPHA_EVERY=100          # ↑ nettoyage plus fréquent
 CULL_SCALE_THRESH=0.5         # ↓ supprime petits clusters instables
 
 ########################################
@@ -67,7 +67,7 @@ CULL_SCALE_THRESH=0.5         # ↓ supprime petits clusters instables
 USE_BILATERAL_GRID=true
 USE_SCALE_REGULARIZATION=False
 
-MAX_GAUSS_RATIO=40.0          # ↓ limite taille splats
+MAX_GAUSS_RATIO=400.0          # ↓ limite taille splats
 SSIM_LAMBDA=0.25             # léger boost stabilité image (optionnel)
 
 ########################################
